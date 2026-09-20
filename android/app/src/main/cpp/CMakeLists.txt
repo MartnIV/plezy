@@ -37,3 +37,17 @@ target_link_libraries(ffmpegJNI
     swresample
     android
     log)
+
+# Immersive player (Phase 2). The OpenXR loader arrives as a prefab package from
+# the org.khronos.openxr:openxr_loader_for_android AAR, so the .so is packaged
+# by Gradle and only the headers and an import target are needed here.
+find_package(OpenXR REQUIRED CONFIG)
+
+add_library(plezy_xr SHARED xr/xr_probe.cpp)
+target_compile_features(plezy_xr PRIVATE cxx_std_17)
+target_link_libraries(plezy_xr
+    OpenXR::openxr_loader
+    android
+    EGL
+    GLESv3
+    log)

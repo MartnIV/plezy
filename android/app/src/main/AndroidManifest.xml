@@ -73,6 +73,17 @@
                 <data android:scheme="plezy" android:host="play"/>
             </intent-filter>
         </activity>
+        <!-- Phase 2 scaffolding: reports the headset's OpenXR capabilities to
+             logcat and exits. Exported only so `adb shell am start` can reach
+             it during development; it takes no input, touches no app data and
+             renders nothing. Delete this along with XrProbeActivity once the
+             immersive player activity supersedes it. -->
+        <activity
+            android:name=".xr.XrProbeActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay" />
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="com.edde746.plezy.fileprovider"

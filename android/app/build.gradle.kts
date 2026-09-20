@@ -362,6 +362,12 @@ android {
     }
   }
 
+  // The OpenXR loader AAR ships its headers and import target as a prefab
+  // package; CMake consumes it with find_package(OpenXR CONFIG).
+  buildFeatures {
+    prefab = true
+  }
+
   lint {
     // Enforce the app-owned minSdk boundary without auditing upstream AndroidX.
     checkDependencies = false
@@ -451,6 +457,10 @@ dependencies {
   // Keeping libass in-project lets its static core share the app's native
   // packaging rules.
   implementation(project(":libass"))
+
+  // OpenXR loader for the immersive player. Khronos' official Android build;
+  // the runtime itself belongs to Horizon OS, this is only the loader.
+  implementation("org.khronos.openxr:openxr_loader_for_android:1.1.49")
 
   testImplementation("junit:junit:4.13.2")
   // Real android.util.* implementations for tests exercising media3 classes

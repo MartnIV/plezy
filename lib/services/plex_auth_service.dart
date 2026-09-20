@@ -151,9 +151,20 @@ class PlexAuthService {
     return false;
   }
 
-  Future<Map<String, dynamic>> createPin() async {
+  /// Creates a Plex PIN.
+  ///
+  /// [strong] asks plex.tv for a long, high-entropy code. That is the right
+  /// choice whenever the code travels by machine -- embedded in the auth URL a
+  /// QR encodes, or handed to a browser -- because nobody has to read it.
+  ///
+  /// Pass `false` for the plex.tv/link hand-off: that page accepts the short
+  /// four-character form, and a strong code is unusable there because it is far
+  /// too long for someone to read off a headset panel and retype. Short codes
+  /// are the weaker credential, which is why they are not the default; plex.tv
+  /// expires them quickly for the same reason.
+  Future<Map<String, dynamic>> createPin({bool strong = true}) async {
     final response = await _http.post(
-      '$_plexApiBase/pins?strong=true',
+      '$_plexApiBase/pins?strong=$strong',
       headers: _getCommonHeaders(),
       timeout: MediaServerTimeouts.plexTvReceive,
     );

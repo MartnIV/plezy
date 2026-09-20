@@ -20,8 +20,15 @@ class _StalledPlexAuthService extends PlexAuthService {
   _StalledPlexAuthService()
     : super.forTesting(http: MediaServerHttpClient(client: MockClient((_) async => http.Response('{}', 200))));
 
+  /// Records what each hand-off asked plex.tv for: the link code is unusable
+  /// unless `strong: false` requests the short four-character form.
+  final List<bool> strongRequests = <bool>[];
+
   @override
-  Future<Map<String, dynamic>> createPin() async => <String, dynamic>{'id': 1, 'code': 'ABCD'};
+  Future<Map<String, dynamic>> createPin({bool strong = true}) async {
+    strongRequests.add(strong);
+    return <String, dynamic>{'id': 1, 'code': strong ? 'longcode0123456789abcdef' : 'ABCD'};
+  }
 
   @override
   String getAuthUrl(String pinCode) => 'https://app.plex.tv/auth#?code=$pinCode';
@@ -72,7 +79,10 @@ void main() {
     TvDetectionService.debugReset();
   });
 
+  late _StalledPlexAuthService service;
+
   Future<void> pumpFlow(WidgetTester tester) async {
+    service = _StalledPlexAuthService();
     await tester.pumpWidget(
       TranslationProvider(
         child: MaterialApp(
@@ -81,7 +91,7 @@ void main() {
             body: PlexPinAuthFlow(
               onTokenReceived: (_) async {},
               autoStartQrOnTV: false,
-              serviceFactory: () async => _StalledPlexAuthService(),
+              serviceFactory: () async => service,
             ),
           ),
         ),
@@ -134,11 +144,26 @@ void main() {
     await tester.pump();
     await tester.pump();
 
+    // plex.tv/link takes the short form; the strong code plex.tv issues by
+    // default is machine-sized and cannot be read off a panel and retyped.
+    expect(service.strongRequests, [false]);
     expect(find.text('ABCD'), findsOneWidget);
     expect(find.text(t.auth.plexLinkCodeUrl), findsOneWidget);
     expect(find.byType(QrImageView), findsNothing);
     expect(launched, isEmpty);
     expect(find.text(t.auth.waitingForAuth), findsNothing);
+  });
+
+  testWidgets('the browser hand-off still asks for a strong pin', (tester) async {
+    TvDetectionService.debugSetVrOverride(false);
+    TvDetectionService.debugSetAutomotiveOverride(false);
+    await pumpFlow(tester);
+
+    await tester.tap(find.text(t.auth.signInWithPlex));
+    await tester.pump();
+    await tester.pump();
+
+    expect(service.strongRequests, [true]);
   });
 
   testWidgets('the QR action also resolves to the link code in a headset', (tester) async {

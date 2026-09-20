@@ -146,7 +146,9 @@ class _PlexPinAuthFlowState extends State<PlexPinAuthFlow> {
     });
 
     try {
-      final pinData = await svc.createPin();
+      // plex.tv/link only accepts the short four-character code; the strong
+      // code plex.tv issues by default is machine-sized and cannot be retyped.
+      final pinData = await svc.createPin(strong: !resolvedUseLinkCode);
       if (!_isCurrentAttempt(attemptId)) return;
       final pinId = pinData['id'] as int;
       final pinCode = pinData['code'] as String;

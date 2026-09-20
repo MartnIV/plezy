@@ -119,6 +119,15 @@ class Translations$auth$en {
 	/// en: 'Show QR Code'
 	String get showQRCode => 'Show QR Code';
 
+	/// en: 'Enter a code instead'
+	String get showPlexLinkCode => 'Enter a code instead';
+
+	/// en: 'On your phone or computer, go to plex.tv/link and enter this code'
+	String get plexLinkCodeInstructions => 'On your phone or computer, go to plex.tv/link and enter this code';
+
+	/// en: 'plex.tv/link'
+	String get plexLinkCodeUrl => 'plex.tv/link';
+
 	/// en: 'Authenticate'
 	String get authenticate => 'Authenticate';
 
@@ -7093,6 +7102,9 @@ extension on Translations {
 			'app.title' => 'Plezy',
 			'auth.signInWithPlex' => 'Sign in with Plex',
 			'auth.showQRCode' => 'Show QR Code',
+			'auth.showPlexLinkCode' => 'Enter a code instead',
+			'auth.plexLinkCodeInstructions' => 'On your phone or computer, go to plex.tv/link and enter this code',
+			'auth.plexLinkCodeUrl' => 'plex.tv/link',
 			'auth.authenticate' => 'Authenticate',
 			'auth.authenticationTimeout' => 'Authentication timed out. Please try again.',
 			'auth.scanQRToSignIn' => 'Scan this QR code to sign in',
@@ -7599,11 +7611,11 @@ extension on Translations {
 			'fileInfo.matchScore' => 'Match Score',
 			'fileInfo.externalDelivery' => 'Can Be Served Separately',
 			'fileInfo.sidecarPath' => 'Sidecar Path',
+			_ => null,
+		} ?? switch (path) {
 			'fileInfo.sourceStream' => 'Copied From',
 			'fileInfo.temporary' => 'Temporary',
 			'fileInfo.timeBase' => 'Time Base',
-			_ => null,
-		} ?? switch (path) {
 			'fileInfo.overallBitrate' => 'Overall Bitrate',
 			'fileInfo.path' => 'Path',
 			'fileInfo.fileName' => 'File Name',
@@ -8113,11 +8125,11 @@ extension on Translations {
 			'libraries.sort' => 'Sort',
 			'libraries.sortBy' => 'Sort By',
 			'libraries.filters' => 'Filters',
+			_ => null,
+		} ?? switch (path) {
 			'libraries.confirmActionMessage' => 'Are you sure you want to perform this action?',
 			'libraries.showLibrary' => 'Show library',
 			'libraries.hideLibrary' => 'Hide library',
-			_ => null,
-		} ?? switch (path) {
 			'libraries.libraryOptions' => 'Library options',
 			'libraries.content' => 'library content',
 			'libraries.selectLibrary' => 'Select library',
@@ -8627,11 +8639,11 @@ extension on Translations {
 			'downloads.storageUnavailable' => 'Downloads stopped because available storage could not be checked. Check the download location, then retry.',
 			'downloads.episodesQueued' => ({required Object count}) => '${count} episodes queued for download',
 			'downloads.downloadDeleted' => 'Download deleted',
+			_ => null,
+		} ?? switch (path) {
 			'downloads.deleteConfirm' => ({required Object title}) => 'Delete "${title}" from this device?',
 			'downloads.cancelledDownloadTitle' => 'Canceled Download',
 			'downloads.cancelledDownloadMessage' => 'This download was canceled. What would you like to do?',
-			_ => null,
-		} ?? switch (path) {
 			'downloads.allEpisodesAlreadyDownloaded' => 'All episodes already downloaded',
 			'downloads.resumeDownload' => 'Resume download',
 			'downloads.cancelledDownload' => 'Canceled download',

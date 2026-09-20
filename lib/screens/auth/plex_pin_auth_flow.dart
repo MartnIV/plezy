@@ -22,6 +22,17 @@ import '../../utils/platform_detector.dart';
 /// scan target, the retry action and the error copy inside the app.
 bool plexSignInRequiresInAppQr({required bool isAutomotive}) => isAutomotive;
 
+/// Whether the PIN hand-off should be shown as a plex.tv/link code instead of
+/// a QR code or a browser trip.
+///
+/// A QR code rendered inside a headset cannot be scanned: the panel only exists
+/// on the wearer's displays, and the wearer is the one holding the phone. The
+/// in-app browser is little better, since signing in means typing a password on
+/// a virtual keyboard with a ray pointer. A short code the viewer reads out of
+/// the headset and types on a device they already trust avoids both, and the
+/// PIN is claimed by polling, so nothing has to hand control back to the app.
+bool plexSignInPrefersLinkCode({required bool isVr}) => isVr;
+
 /// Self-contained Plex PIN/QR auth flow.
 ///
 /// Renders the polling UI (QR code or browser-waiting spinner) once an
@@ -77,7 +88,9 @@ class _PlexPinAuthFlowState extends State<PlexPinAuthFlow> {
   PlexAuthService? _authService;
   bool _isPolling = false;
   bool _useQr = false;
+  bool _useLinkCode = false;
   String? _qrAuthUrl;
+  String? _linkCode;
   int _attemptId = 0;
   String? _errorMessage;
 
@@ -85,6 +98,7 @@ class _PlexPinAuthFlowState extends State<PlexPinAuthFlow> {
   void initState() {
     super.initState();
     _useQr = PlatformDetector.isTV() || plexSignInRequiresInAppQr(isAutomotive: PlatformDetector.isAutomotive());
+    _useLinkCode = plexSignInPrefersLinkCode(isVr: PlatformDetector.isVR());
     if (widget.initializeService) unawaited(_initService());
   }
 
@@ -109,19 +123,26 @@ class _PlexPinAuthFlowState extends State<PlexPinAuthFlow> {
     super.dispose();
   }
 
-  Future<void> _start({required bool useQr}) async {
+  Future<void> _start({required bool useQr, bool useLinkCode = false}) async {
     final svc = _authService;
     if (svc == null) return;
+    // A headset can neither scan its own QR code nor comfortably type a
+    // password into an in-app browser, so both actions resolve to the link code
+    // there. It is checked first because it supersedes the QR fallback below.
+    final resolvedUseLinkCode = useLinkCode || plexSignInPrefersLinkCode(isVr: PlatformDetector.isVR());
     // A car has no browser to hand the PIN URL to, so the browser action
     // resolves to the in-app QR there instead of a spinner that can only time
     // out. Every other platform honours what the user pressed.
-    final resolvedUseQr = useQr || plexSignInRequiresInAppQr(isAutomotive: PlatformDetector.isAutomotive());
+    final resolvedUseQr =
+        !resolvedUseLinkCode && (useQr || plexSignInRequiresInAppQr(isAutomotive: PlatformDetector.isAutomotive()));
     final attemptId = ++_attemptId;
     setState(() {
       _useQr = resolvedUseQr;
+      _useLinkCode = resolvedUseLinkCode;
       _isPolling = true;
       _errorMessage = null;
       _qrAuthUrl = null;
+      _linkCode = null;
     });
 
     try {
@@ -132,7 +153,11 @@ class _PlexPinAuthFlowState extends State<PlexPinAuthFlow> {
       final url = svc.getAuthUrl(pinCode);
 
       if (!_isCurrentAttempt(attemptId)) return;
-      if (resolvedUseQr) {
+      if (resolvedUseLinkCode) {
+        // Nothing is launched: the viewer types this code at plex.tv/link on
+        // another device and pollPinUntilClaimed below picks the claim up.
+        setState(() => _linkCode = pinCode);
+      } else if (resolvedUseQr) {
         setState(() => _qrAuthUrl = url);
       } else {
         final uri = Uri.parse(url);
@@ -216,6 +241,7 @@ class _PlexPinAuthFlowState extends State<PlexPinAuthFlow> {
     setState(() {
       _isPolling = false;
       _qrAuthUrl = null;
+      _linkCode = null;
       _errorMessage = null;
     });
   }
@@ -226,6 +252,9 @@ class _PlexPinAuthFlowState extends State<PlexPinAuthFlow> {
 
     if (_isPolling) {
       final isDesktop = MediaQuery.sizeOf(context).width > 700;
+      if (_useLinkCode && _linkCode != null) {
+        return _buildLinkCode(theme);
+      }
       if (_useQr && _qrAuthUrl != null) {
         return _buildQr(theme, isDesktop ? 300 : 200);
       }
@@ -262,8 +291,63 @@ class _PlexPinAuthFlowState extends State<PlexPinAuthFlow> {
         const SizedBox(height: 12),
         FocusableButton(
           onPressed: busy ? null : qr,
-          child: OutlinedButton(onPressed: busy ? null : qr, child: Text(t.auth.showQRCode)),
+          child: OutlinedButton(
+            onPressed: busy ? null : qr,
+            // In a headset the same action yields a code to type elsewhere,
+            // because the QR it would otherwise draw is unscannable there.
+            child: Text(PlatformDetector.isVR() ? t.auth.showPlexLinkCode : t.auth.showQRCode),
+          ),
         ),
+      ],
+    );
+  }
+
+  /// plex.tv/link hand-off: the viewer reads a short code out of the headset
+  /// and types it on a device they already trust. Deliberately large and
+  /// letter-spaced — it is read off a panel at arm's length, through lenses,
+  /// and the characters have to survive that.
+  Widget _buildLinkCode(ThemeData theme) {
+    return Column(
+      mainAxisSize: .min,
+      children: [
+        Text(
+          t.auth.plexLinkCodeInstructions,
+          textAlign: TextAlign.center,
+          style: theme.textTheme.bodyLarge?.copyWith(color: theme.colorScheme.onSurface.withValues(alpha: 0.7)),
+        ),
+        const SizedBox(height: 20),
+        SelectableText(
+          t.auth.plexLinkCodeUrl,
+          textAlign: TextAlign.center,
+          style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 20),
+        Container(
+          padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 32),
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(tokens(context).radiusMd),
+          ),
+          child: SelectableText(
+            _linkCode!,
+            textAlign: TextAlign.center,
+            style: theme.textTheme.displaySmall?.copyWith(
+              fontWeight: FontWeight.bold,
+              letterSpacing: 12,
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
+          ),
+        ),
+        const SizedBox(height: 24),
+        _buildRetryCancelRow(),
+        if (_errorMessage != null) ...[
+          const SizedBox(height: 12),
+          Text(
+            _errorMessage!,
+            style: TextStyle(color: theme.colorScheme.error),
+            textAlign: TextAlign.center,
+          ),
+        ],
       ],
     );
   }

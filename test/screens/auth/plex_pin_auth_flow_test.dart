@@ -68,6 +68,7 @@ void main() {
       null,
     );
     TvDetectionService.debugSetAutomotiveOverride(null);
+    TvDetectionService.debugSetVrOverride(null);
     TvDetectionService.debugReset();
   });
 
@@ -119,6 +120,54 @@ void main() {
     expect(launched.single, startsWith('https://app.plex.tv/auth'));
     expect(find.text(t.auth.waitingForAuth), findsOneWidget);
     expect(find.byType(QrImageView), findsNothing);
+  });
+
+  testWidgets('a headset hands the PIN over as a plex.tv/link code', (tester) async {
+    // A QR code drawn inside a headset cannot be scanned -- the panel exists
+    // only on the wearer's displays, and the wearer holds the phone. Typing a
+    // password into an in-app browser with a ray pointer is no better, so both
+    // actions resolve to a code the viewer reads out and types elsewhere.
+    TvDetectionService.debugSetVrOverride(true);
+    await pumpFlow(tester);
+
+    await tester.tap(find.text(t.auth.signInWithPlex));
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.text('ABCD'), findsOneWidget);
+    expect(find.text(t.auth.plexLinkCodeUrl), findsOneWidget);
+    expect(find.byType(QrImageView), findsNothing);
+    expect(launched, isEmpty);
+    expect(find.text(t.auth.waitingForAuth), findsNothing);
+  });
+
+  testWidgets('the QR action also resolves to the link code in a headset', (tester) async {
+    TvDetectionService.debugSetVrOverride(true);
+    await pumpFlow(tester);
+
+    // The button carries the headset label, since it no longer draws a QR.
+    await tester.tap(find.text(t.auth.showPlexLinkCode));
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.text('ABCD'), findsOneWidget);
+    expect(find.byType(QrImageView), findsNothing);
+  });
+
+  testWidgets('cancel exits the link-code wait back to the initial actions', (tester) async {
+    TvDetectionService.debugSetVrOverride(true);
+    await pumpFlow(tester);
+
+    await tester.tap(find.text(t.auth.signInWithPlex));
+    await tester.pump();
+    await tester.pump();
+    expect(find.text('ABCD'), findsOneWidget);
+
+    await tester.tap(find.text(t.common.cancel));
+    await tester.pump();
+
+    expect(find.text('ABCD'), findsNothing);
+    expect(find.text(t.auth.signInWithPlex), findsOneWidget);
   });
 
   testWidgets('the QR button is unaffected off a car', (tester) async {

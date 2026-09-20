@@ -5,6 +5,9 @@
   "auth": {
     "signInWithPlex": "Sign in with Plex",
     "showQRCode": "Show QR Code",
+    "showPlexLinkCode": "Enter a code instead",
+    "plexLinkCodeInstructions": "On your phone or computer, go to plex.tv/link and enter this code",
+    "plexLinkCodeUrl": "plex.tv/link",
     "authenticate": "Authenticate",
     "authenticationTimeout": "Authentication timed out. Please try again.",
     "scanQRToSignIn": "Scan this QR code to sign in",

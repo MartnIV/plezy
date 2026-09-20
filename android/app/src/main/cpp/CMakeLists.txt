@@ -43,7 +43,9 @@ target_link_libraries(ffmpegJNI
 # by Gradle and only the headers and an import target are needed here.
 find_package(OpenXR REQUIRED CONFIG)
 
-add_library(plezy_xr SHARED xr/xr_probe.cpp)
+add_library(plezy_xr SHARED
+    xr/xr_probe.cpp
+    xr/immersive_session.cpp)
 target_compile_features(plezy_xr PRIVATE cxx_std_17)
 target_link_libraries(plezy_xr
     OpenXR::openxr_loader

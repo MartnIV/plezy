@@ -160,10 +160,22 @@ open class MpvPlayerPlugin(
     channels.detach()
   }
 
+  /**
+   * The only writer of [playerCore], so the immersive player's view of the live
+   * core cannot drift from this plugin's. Audio-only cores are never published:
+   * they have no video output to redirect into a headset.
+   */
+  private fun setPlayerCore(core: MpvPlayerCore?) {
+    val previous = playerCore
+    if (previous != null && previous !== core) ActiveVideoPlayer.unregister(previous)
+    playerCore = core
+    if (core != null && !audioOnly) ActiveVideoPlayer.register(core)
+  }
+
   private fun takeCoreForTeardown(): MpvPlayerCore? {
     ++sessionGeneration
     val core = playerCore
-    playerCore = null
+    setPlayerCore(null)
     coreInstanceId = null
     cancelPendingInits()
     return core
@@ -323,14 +335,14 @@ open class MpvPlayerPlugin(
         if (playerCore != null && playerCore?.isInitialized != true) {
           Log.w(tag, "Discarding stale uninitialized core before re-init")
           playerCore?.dispose()
-          playerCore = null
+          setPlayerCore(null)
         }
 
         gen = ++sessionGeneration
         core = createCore(coreContext, hardwareDecoding, subtitleRenderScale, logLevel).apply {
           delegate = this@MpvPlayerPlugin
         }
-        playerCore = core
+        setPlayerCore(core)
         coreInstanceId = call.argument<Number>("instanceId")?.toLong()
       } catch (e: Exception) {
         Log.e(tag, "Failed to initialize: ${e.message}", e)
@@ -355,7 +367,7 @@ open class MpvPlayerPlugin(
           !isCurrentInitAttempt(attempt)
         if (stale || !success) {
           if (playerCore === core) {
-            playerCore = null
+            setPlayerCore(null)
             coreInstanceId = null
           }
           core.dispose()

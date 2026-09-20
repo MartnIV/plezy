@@ -362,6 +362,14 @@ class MpvPlayerCore private constructor(
   @Volatile private var disposing: Boolean = false
   private var nativeDisposalComplete: CountDownLatch? = null
 
+  // Set while video output belongs to something other than the panel's
+  // SurfaceView -- currently the immersive player's OpenXR swapchain. The
+  // SurfaceHolder callbacks are ignored for as long as it is held, because the
+  // panel activity is merely backgrounded during immersive playback and its
+  // SurfaceView is torn down as it goes, which would otherwise revoke the
+  // surface the headset is being fed from.
+  @Volatile private var externalVideoSurface: Surface? = null
+
   @Volatile private var pendingSurface: Surface? = null
 
   @Volatile private var attachedSurface: Surface? = null
@@ -1288,11 +1296,73 @@ class MpvPlayerCore private constructor(
     audioFocusManager?.abandonAudioFocus()
   }
 
+  /**
+   * Redirects video output to a Surface this core does not own -- the immersive
+   * player's OpenXR swapchain.
+   *
+   * mpv is told nothing new: this is the same hand-off the panel's SurfaceView
+   * goes through, so decoding, tracks and position are untouched and playback
+   * continues across the move. While it is held, the SurfaceHolder callbacks
+   * are ignored, because the panel activity stays alive but backgrounded and
+   * would otherwise revoke this surface as its own view is torn down.
+   *
+   * [width] and [height] are the swapchain's, not the panel's; mpv scales to
+   * them and the compositor samples the result.
+   */
+  fun attachExternalVideoSurface(surface: Surface, width: Int, height: Int) {
+    if (disposing) return
+    if (!surface.isValid) {
+      PlayerDebugLog.d(TAG) { "Refusing an invalid external surface" }
+      return
+    }
+    PlayerDebugLog.d(TAG) { "Attaching external video surface ${width}x$height" }
+    externalVideoSurface = surface
+    pendingSurface = surface
+    videoSurfaceGeneration += 1L
+    videoOutputEpoch += 1L
+    rememberSurfaceSize(width, height)
+    if (player == null) {
+      PlayerDebugLog.d(TAG) { "Deferring external surface until MPV init completes" }
+      return
+    }
+    refreshVideoOutput("attachExternalVideoSurface")
+  }
+
+  /**
+   * Gives video output back to the panel's SurfaceView.
+   *
+   * The surface is not released here: the immersive session owns it and tears
+   * it down with its swapchain. If the panel's view is already back, its
+   * surface is picked up directly; otherwise output parks on the placeholder
+   * until the next surfaceCreated, which is the same path a backgrounded
+   * player already takes.
+   */
+  fun detachExternalVideoSurface() {
+    if (externalVideoSurface == null) return
+    PlayerDebugLog.d(TAG) { "Detaching external video surface" }
+    externalVideoSurface = null
+    val panelSurface = surfaceView?.holder?.surface?.takeIf { it.isValid }
+    pendingSurface = panelSurface
+    videoSurfaceGeneration += 1L
+    videoOutputEpoch += 1L
+    rememberCurrentSurfaceSize()
+    if (player == null) return
+    if (panelSurface != null) {
+      refreshVideoOutput("detachExternalVideoSurface")
+    } else {
+      handoffDestroyedSurface("detachExternalVideoSurface", videoLost = true)
+    }
+  }
+
   // SurfaceHolder.Callback
 
   override fun surfaceCreated(holder: SurfaceHolder) {
     PlayerDebugLog.d(TAG) { "Surface created" }
     if (disposing) return
+    if (externalVideoSurface != null) {
+      PlayerDebugLog.d(TAG) { "Ignoring surfaceCreated: video output is external" }
+      return
+    }
 
     val surface = holder.surface
     pendingSurface = surface.takeIf { it.isValid }
@@ -1309,12 +1379,17 @@ class MpvPlayerCore private constructor(
 
   override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
     PlayerDebugLog.d(TAG) { "Surface changed: ${width}x$height" }
+    if (externalVideoSurface != null) return
     rememberSurfaceSize(width, height)
     refreshVideoOutput("surfaceChanged")
   }
 
   override fun surfaceDestroyed(holder: SurfaceHolder) {
     PlayerDebugLog.d(TAG) { "Surface destroyed" }
+    if (externalVideoSurface != null) {
+      PlayerDebugLog.d(TAG) { "Ignoring surfaceDestroyed: video output is external" }
+      return
+    }
     pendingSurface = null
     if (disposing) {
       awaitNativeDisposal()

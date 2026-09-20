@@ -7,6 +7,7 @@ import android.graphics.Paint
 import android.os.Bundle
 import android.util.Log
 import android.view.Surface
+import com.edde746.plezy.mpv.ActiveVideoPlayer
 
 /**
  * Owns the native OpenXR session and the Android Surface it composites.
@@ -56,18 +57,22 @@ object ImmersiveSession {
 }
 
 /**
- * Brings the immersive session up and paints a test pattern into its Surface.
+ * Shows playback on the immersive screen.
  *
- * This is the step that proves the pipeline end to end -- swapchain, layer,
- * compositor -- without mpv in the way. What should appear is a curved screen
- * floating four metres out. Once that is confirmed, the Canvas here is replaced
- * by the player's own output and nothing else about the session changes.
+ * The player itself is not moved: [ActiveVideoPlayer] hands back the same core
+ * the panel was driving and it is pointed at this session's swapchain, so
+ * decoding, tracks and position carry across untouched. The panel activity
+ * stays alive but backgrounded -- finishing it, as Meta's hybrid-app guidance
+ * suggests, would take the FlutterEngine and the player down with it.
  *
- * Launch with:
+ * With no player running it falls back to the bring-up test pattern, which also
+ * keeps this launchable on its own:
+ *   adb shell am force-stop com.edde746.plezy
  *   adb shell am start -n com.edde746.plezy/.xr.ImmersivePlayerActivity
  */
 class ImmersivePlayerActivity : Activity() {
   private var surface: Surface? = null
+  private var attachedToPlayer = false
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
@@ -78,7 +83,16 @@ class ImmersivePlayerActivity : Activity() {
       return
     }
     surface = started
-    paintTestPattern(started)
+
+    val core = ActiveVideoPlayer.current()
+    if (core != null) {
+      core.attachExternalVideoSurface(started, ImmersiveSession.DEFAULT_WIDTH, ImmersiveSession.DEFAULT_HEIGHT)
+      attachedToPlayer = true
+      Log.i(TAG, "video output redirected to the immersive swapchain")
+    } else {
+      Log.i(TAG, "no active player; showing the bring-up pattern")
+      paintTestPattern(started)
+    }
   }
 
   /**
@@ -122,6 +136,12 @@ class ImmersivePlayerActivity : Activity() {
 
   override fun onDestroy() {
     super.onDestroy()
+    // Order matters: the player has to let go of the swapchain surface before
+    // the session tears it down, or mpv keeps writing into freed buffers.
+    if (attachedToPlayer) {
+      ActiveVideoPlayer.current()?.detachExternalVideoSurface()
+      attachedToPlayer = false
+    }
     surface = null
     ImmersiveSession.stop()
   }

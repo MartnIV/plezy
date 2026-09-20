@@ -15,6 +15,15 @@ const _androidFeatureFireTv = 'amazon.hardware.fire_tv';
 const _androidFeatureTouchscreen = 'android.hardware.touchscreen';
 const _androidFeatureAutomotive = 'android.hardware.type.automotive';
 
+/// Standalone VR headsets (Meta Quest and the rest of the Horizon OS family).
+///
+/// Horizon OS runs flat apps as 2D panels and drives them with a ray pointer,
+/// so a headset reports no `FEATURE_TOUCHSCREEN` while declaring
+/// `FEATURE_FAKETOUCH`. That combination alone is a genuine TV signal on set-top
+/// hardware, so it cannot be relaxed globally -- the headset is identified
+/// positively instead.
+const _oculusFeatureStandaloneVr = 'oculus.hardware.standalone_vr';
+
 class AndroidTvFeatureDetection {
   final bool isTv;
 
@@ -22,11 +31,21 @@ class AndroidTvFeatureDetection {
   /// [isTv]: `FEATURE_AUTOMOTIVE` is authoritative for the car form factor.
   final bool isAutomotive;
 
+  /// True on a standalone VR headset. Never true together with [isTv]: a
+  /// headset is a pointer-driven form factor, not a ten-foot one.
+  final bool isVr;
+
   /// Diagnostic TV signals, surfaced in the log export only while TV mode is
-  /// active. Non-empty with [isTv] false when automotive vetoed the verdict.
+  /// active. Non-empty with [isTv] false when automotive or VR vetoed the
+  /// verdict.
   final List<String> reasons;
 
-  const AndroidTvFeatureDetection({required this.isTv, required this.isAutomotive, required this.reasons});
+  const AndroidTvFeatureDetection({
+    required this.isTv,
+    required this.isAutomotive,
+    required this.reasons,
+    this.isVr = false,
+  });
 }
 
 AndroidTvFeatureDetection detectAndroidTvFromSystemFeatures(Iterable<String> features) {
@@ -42,9 +61,16 @@ AndroidTvFeatureDetection detectAndroidTvFromSystemFeatures(Iterable<String> fea
   // either would otherwise route a vehicle through the leanback experience.
   final isAutomotive = featureSet.contains(_androidFeatureAutomotive);
 
+  // Neither is a headset. A Quest 3 reports no touchscreen, no leanback, no
+  // television feature and `UI_MODE_TYPE_NORMAL`, so `no_touchscreen` was the
+  // lone signal promoting it to the TV experience -- which switched the app to
+  // d-pad focus navigation and left the ray pointer unable to scroll the hub.
+  final isVr = featureSet.contains(_oculusFeatureStandaloneVr);
+
   return AndroidTvFeatureDetection(
-    isTv: !isAutomotive && reasons.isNotEmpty,
+    isTv: !isAutomotive && !isVr && reasons.isNotEmpty,
     isAutomotive: isAutomotive,
+    isVr: isVr,
     reasons: reasons,
   );
 }
@@ -75,10 +101,12 @@ class TvDetectionService {
   static set debugDetectionGate(Future<void>? value) => _singleton.debugGate = value;
   static bool? _debugAppleTVOverride;
   static bool? _debugAutomotiveOverride;
+  static bool? _debugVrOverride;
   bool _detected = false;
   bool _forceTv = false;
   bool _isAppleTV = false;
   bool _isAutomotive = false;
+  bool _isVr = false;
   bool _initialized = false;
   List<String> _detectionReasons = const [];
 
@@ -101,6 +129,7 @@ class TvDetectionService {
           nativeDetection ?? detectAndroidTvFromSystemFeatures((await deviceInfo.androidInfo).systemFeatures);
       _detected = detection.isTv;
       _isAutomotive = detection.isAutomotive;
+      _isVr = detection.isVr;
       _detectionReasons = detection.reasons;
     } else if (Platform.isIOS) {
       if (_tvosBuild) {
@@ -133,6 +162,11 @@ class TvDetectionService {
   /// driver-distraction gating cannot be switched off from settings.
   bool get isAutomotive => _isAutomotive;
 
+  /// True on a standalone VR headset (Horizon OS). Independent of the force-TV
+  /// override: a viewer may still choose the ten-foot UI in a headset, but the
+  /// pointer-driven platform decisions below must keep following the hardware.
+  bool get isVr => _isVr;
+
   List<String> get _effectiveDetectionReasons {
     final reasons = <String>[..._detectionReasons];
     if (_forceTv && !reasons.contains('force_tv')) reasons.add('force_tv');
@@ -147,8 +181,14 @@ class TvDetectionService {
       final reasons = reasonsValue is Iterable ? reasonsValue.whereType<String>().toList() : <String>[];
       final isTv = result['isTv'] == true;
       final isAutomotive = result['isAutomotive'] == true;
+      final isVr = result['isVr'] == true;
       if (isTv && reasons.isEmpty) reasons.add('native');
-      return AndroidTvFeatureDetection(isTv: isTv && !isAutomotive, isAutomotive: isAutomotive, reasons: reasons);
+      return AndroidTvFeatureDetection(
+        isTv: isTv && !isAutomotive && !isVr,
+        isAutomotive: isAutomotive,
+        isVr: isVr,
+        reasons: reasons,
+      );
     } on MissingPluginException {
       return null;
     } on PlatformException {
@@ -187,6 +227,12 @@ class TvDetectionService {
   /// Synchronous Android Automotive OS check (false before initialization).
   static bool isAutomotiveSync() => _debugAutomotiveOverride ?? _singleton.instance?._isAutomotive ?? false;
 
+  /// Live VR verdict, readable without a [BuildContext]. False until detection
+  /// has run, matching every other accessor here.
+  static bool isVrSync() => _debugVrOverride ?? _singleton.instance?._isVr ?? false;
+
+
+
   @visibleForTesting
   static void debugSetAppleTVOverride(bool? value) {
     _debugAppleTVOverride = value;
@@ -198,10 +244,16 @@ class TvDetectionService {
   }
 
   @visibleForTesting
+  static void debugSetVrOverride(bool? value) {
+    _debugVrOverride = value;
+  }
+
+  @visibleForTesting
   static void debugReset() {
     _singleton.debugReset();
     _debugAppleTVOverride = null;
     _debugAutomotiveOverride = null;
+    _debugVrOverride = null;
   }
 
   static List<String> tvDetectionReasonsSync() => _singleton.instance?._effectiveDetectionReasons ?? const [];
@@ -222,6 +274,12 @@ class PlatformDetector {
   /// True on Android Automotive OS head units.
   static bool isAutomotive() {
     return TvDetectionService.isAutomotiveSync();
+  }
+
+  /// True on a standalone VR headset, where the app runs as a 2D panel driven
+  /// by a ray pointer rather than by touch or a d-pad.
+  static bool isVR() {
+    return TvDetectionService.isVrSync();
   }
 
   /// Detects if the app should use side navigation (Desktop or TV).

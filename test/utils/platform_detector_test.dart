@@ -113,6 +113,48 @@ void main() {
 
       expect(detection.isAutomotive, isFalse);
     });
+
+    // A Quest 3 on Horizon OS v83 reports exactly this set: no touchscreen, no
+    // leanback, no television feature, UI_MODE_TYPE_NORMAL. Before the VR veto
+    // the lone 'no_touchscreen' reason promoted it to the ten-foot experience,
+    // which switched the app to d-pad focus navigation and left the ray pointer
+    // unable to scroll the home hub (upstream #2386).
+    test('classifies standalone VR headsets as headsets, not TVs', () {
+      final detection = detectAndroidTvFromSystemFeatures([
+        'oculus.hardware.standalone_vr',
+        'oculus.software.handtracking',
+        'android.hardware.faketouch',
+      ]);
+
+      expect(detection.isVr, isTrue);
+      expect(detection.isTv, isFalse);
+      expect(detection.reasons, contains('no_touchscreen'));
+    });
+
+    test('VR vetoes a stray leanback flag', () {
+      final detection = detectAndroidTvFromSystemFeatures([
+        'oculus.hardware.standalone_vr',
+        'android.software.leanback',
+      ]);
+
+      expect(detection.isVr, isTrue);
+      expect(detection.isTv, isFalse);
+    });
+
+    // The touchless + faketouch pair a headset shares with a set-top box must
+    // keep meaning TV there, so the veto has to key off the headset itself.
+    test('faketouch set-top boxes remain TVs', () {
+      final detection = detectAndroidTvFromSystemFeatures(['android.hardware.faketouch']);
+
+      expect(detection.isVr, isFalse);
+      expect(detection.isTv, isTrue);
+    });
+
+    test('ordinary devices are not VR', () {
+      final detection = detectAndroidTvFromSystemFeatures(['android.hardware.touchscreen']);
+
+      expect(detection.isVr, isFalse);
+    });
   });
 
   group('pictureInPictureAllowed', () {

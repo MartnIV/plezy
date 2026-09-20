@@ -301,6 +301,7 @@ class MainActivity : FlutterActivity() {
     val hasTouchscreen = pm.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)
     val hasFakeTouch = pm.hasSystemFeature(PackageManager.FEATURE_FAKETOUCH)
     val isAutomotive = pm.hasSystemFeature(PackageManager.FEATURE_AUTOMOTIVE)
+    val isVr = pm.hasSystemFeature(TvDetection.OCULUS_FEATURE_STANDALONE_VR)
 
     val reasons = mutableListOf<String>()
     if (isTelevisionUiMode) reasons.add("ui_mode_television")
@@ -313,8 +314,14 @@ class MainActivity : FlutterActivity() {
       // A car is never a TV: rotary-only head units report no touchscreen, and
       // an OEM image can carry a stray leanback flag. Keep the raw reasons for
       // diagnostics, but never let them promote a vehicle to the TV experience.
-      "isTv" to (!isAutomotive && reasons.isNotEmpty()),
+      //
+      // A standalone VR headset is vetoed for the same reason: Horizon OS runs
+      // flat apps as ray-pointer-driven 2D panels and reports no touchscreen,
+      // so "no_touchscreen" was single-handedly making every Quest a TV --
+      // which forced d-pad focus navigation on a device that points.
+      "isTv" to (!isAutomotive && !isVr && reasons.isNotEmpty()),
       "isAutomotive" to isAutomotive,
+      "isVr" to isVr,
       "reasons" to reasons,
       "isTelevisionUiMode" to isTelevisionUiMode,
       "hasTelevisionFeature" to hasTelevisionFeature,

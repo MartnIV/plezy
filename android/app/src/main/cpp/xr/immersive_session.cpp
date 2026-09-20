@@ -142,6 +142,9 @@ bool CreateInstanceAndSystem(Session& s) {
       XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
       "XR_KHR_android_surface_swapchain",
       "XR_KHR_composition_layer_cylinder",
+      // Corrects the origin mismatch between Surface producers and the
+      // compositor; see the layout chained onto the layer in SubmitFrame.
+      "XR_FB_composition_layer_image_layout",
   };
 
   XrInstanceCreateInfoAndroidKHR androidInfo{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
@@ -296,7 +299,15 @@ void SubmitFrame(Session& s) {
   XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
   if (XR_FAILED(xrBeginFrame(s.session, &beginInfo))) return;
 
+  // An Android Surface producer -- Canvas, MediaCodec, anything -- writes with
+  // the origin at the top left, while the compositor samples from the bottom
+  // left. Without this the picture arrives flipped top to bottom, which reads
+  // as upside down *and* mirrored.
+  XrCompositionLayerImageLayoutFB imageLayout{XR_TYPE_COMPOSITION_LAYER_IMAGE_LAYOUT_FB};
+  imageLayout.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
+
   XrCompositionLayerCylinderKHR cylinder{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
+  cylinder.next = &imageLayout;
   cylinder.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
   cylinder.space = s.space;
   cylinder.eyeVisibility = XR_EYE_VISIBILITY_BOTH;

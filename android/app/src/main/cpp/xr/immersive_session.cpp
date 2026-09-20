@@ -59,6 +59,17 @@ struct Session {
   XrSpace space = XR_NULL_HANDLE;
   XrSwapchain swapchain = XR_NULL_HANDLE;
   XrSessionState state = XR_SESSION_STATE_UNKNOWN;
+
+  // Controller input. The Touch controllers are not Android input devices --
+  // dumpsys lists only the audio card and the power keys -- so they exist for
+  // this app solely through OpenXR's action system.
+  XrActionSet actionSet = XR_NULL_HANDLE;
+  XrAction playPauseAction = XR_NULL_HANDLE;
+  XrAction exitAction = XR_NULL_HANDLE;
+  XrAction seekAction = XR_NULL_HANDLE;
+  bool actionsAttached = false;
+  // Rising-edge latch for the stick, so holding it does not spray seeks.
+  int lastSeekDirection = 0;
   bool running = false;  // between xrBeginSession and xrEndSession
 
   EGLDisplay eglDisplay = EGL_NO_DISPLAY;
@@ -217,6 +228,76 @@ bool CreateSession(Session& s) {
   return true;
 }
 
+// Action codes shared with ImmersiveSession.onInputFromNative.
+constexpr int kInputPlayPause = 1;
+constexpr int kInputSeekBackward = 2;
+constexpr int kInputSeekForward = 3;
+constexpr int kInputExit = 4;
+
+XrPath ToPath(XrInstance instance, const char* text) {
+  XrPath path = XR_NULL_PATH;
+  xrStringToPath(instance, text, &path);
+  return path;
+}
+
+bool CreateInput(Session& s) {
+  XrActionSetCreateInfo setInfo{XR_TYPE_ACTION_SET_CREATE_INFO};
+  std::strncpy(setInfo.actionSetName, "player", XR_MAX_ACTION_SET_NAME_SIZE - 1);
+  std::strncpy(setInfo.localizedActionSetName, "Player", XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE - 1);
+  if (XR_FAILED(xrCreateActionSet(s.instance, &setInfo, &s.actionSet))) {
+    LOGE("xrCreateActionSet failed");
+    return false;
+  }
+
+  const auto createAction = [&](const char* name, const char* localized, XrActionType type, XrAction* out) {
+    XrActionCreateInfo info{XR_TYPE_ACTION_CREATE_INFO};
+    std::strncpy(info.actionName, name, XR_MAX_ACTION_NAME_SIZE - 1);
+    std::strncpy(info.localizedActionName, localized, XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
+    info.actionType = type;
+    return XR_SUCCEEDED(xrCreateAction(s.actionSet, &info, out));
+  };
+
+  if (!createAction("play_pause", "Play or pause", XR_ACTION_TYPE_BOOLEAN_INPUT, &s.playPauseAction) ||
+      !createAction("exit_immersive", "Leave the big screen", XR_ACTION_TYPE_BOOLEAN_INPUT, &s.exitAction) ||
+      !createAction("seek", "Seek", XR_ACTION_TYPE_VECTOR2F_INPUT, &s.seekAction)) {
+    LOGE("could not create the player actions");
+    return false;
+  }
+
+  // Both hands are bound for every action: a viewer lying on a sofa should not
+  // have to work out which controller the app decided to listen to.
+  const std::vector<XrActionSuggestedBinding> bindings{
+      {s.playPauseAction, ToPath(s.instance, "/user/hand/right/input/a/click")},
+      {s.playPauseAction, ToPath(s.instance, "/user/hand/left/input/x/click")},
+      {s.exitAction, ToPath(s.instance, "/user/hand/right/input/b/click")},
+      {s.exitAction, ToPath(s.instance, "/user/hand/left/input/y/click")},
+      {s.seekAction, ToPath(s.instance, "/user/hand/right/input/thumbstick")},
+      {s.seekAction, ToPath(s.instance, "/user/hand/left/input/thumbstick")},
+  };
+
+  XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+  suggested.interactionProfile = ToPath(s.instance, "/interaction_profiles/oculus/touch_controller");
+  suggested.countSuggestedBindings = static_cast<uint32_t>(bindings.size());
+  suggested.suggestedBindings = bindings.data();
+  const XrResult suggestResult = xrSuggestInteractionProfileBindings(s.instance, &suggested);
+  if (XR_FAILED(suggestResult)) {
+    LOGE("xrSuggestInteractionProfileBindings failed: %d", suggestResult);
+    return false;
+  }
+
+  XrSessionActionSetsAttachInfo attachInfo{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+  attachInfo.countActionSets = 1;
+  attachInfo.actionSets = &s.actionSet;
+  const XrResult attachResult = xrAttachSessionActionSets(s.session, &attachInfo);
+  if (XR_FAILED(attachResult)) {
+    LOGE("xrAttachSessionActionSets failed: %d", attachResult);
+    return false;
+  }
+  s.actionsAttached = true;
+  LOGI("controller actions attached");
+  return true;
+}
+
 bool CreateSurfaceSwapchain(Session& s, JNIEnv* env) {
   PFN_xrCreateSwapchainAndroidSurfaceKHR createSurfaceSwapchain = nullptr;
   if (XR_FAILED(xrGetInstanceProcAddr(s.instance, "xrCreateSwapchainAndroidSurfaceKHR",
@@ -285,8 +366,58 @@ void PollEvents(Session& s) {
       xrEndSession(s.session);
       s.running = false;
       LOGI("session ended");
+      // The runtime stops the session when the viewer leaves the app -- the
+      // Meta button, taking the headset off, the system menu. Treat it as an
+      // exit and let the activity finish, rather than sitting idle forever
+      // waiting for a READY that only comes back if they return.
+      s.quit = true;
     } else if (s.state == XR_SESSION_STATE_EXITING || s.state == XR_SESSION_STATE_LOSS_PENDING) {
       s.quit = true;
+    }
+  }
+}
+
+void DispatchInput(JNIEnv* env, int action);
+
+// Reads the controllers once per frame and reports button edges.
+//
+// Only while focused: an unfocused session still syncs, but the runtime is
+// giving the controllers to the system menu, and a stray press there must not
+// reach playback.
+void PollInput(Session& s, JNIEnv* env) {
+  if (!s.actionsAttached || s.state != XR_SESSION_STATE_FOCUSED) return;
+
+  XrActiveActionSet active{s.actionSet, XR_NULL_PATH};
+  XrActionsSyncInfo syncInfo{XR_TYPE_ACTIONS_SYNC_INFO};
+  syncInfo.countActiveActionSets = 1;
+  syncInfo.activeActionSets = &active;
+  if (XR_FAILED(xrSyncActions(s.session, &syncInfo))) return;
+
+  const auto pressed = [&](XrAction action) {
+    XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO};
+    getInfo.action = action;
+    XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
+    if (XR_FAILED(xrGetActionStateBoolean(s.session, &getInfo, &state))) return false;
+    // changedSinceLastSync is what makes this a press rather than a hold.
+    return state.isActive == XR_TRUE && state.currentState == XR_TRUE && state.changedSinceLastSync == XR_TRUE;
+  };
+
+  if (pressed(s.playPauseAction)) DispatchInput(env, kInputPlayPause);
+  if (pressed(s.exitAction)) DispatchInput(env, kInputExit);
+
+  XrActionStateGetInfo seekInfo{XR_TYPE_ACTION_STATE_GET_INFO};
+  seekInfo.action = s.seekAction;
+  XrActionStateVector2f seek{XR_TYPE_ACTION_STATE_VECTOR2F};
+  if (XR_SUCCEEDED(xrGetActionStateVector2f(s.session, &seekInfo, &seek)) && seek.isActive == XR_TRUE) {
+    // Generous deadzone: a thumb resting on the stick should not scrub the
+    // film, and the edge latch means one push is one seek however long it
+    // is held.
+    constexpr float kDeadzone = 0.6f;
+    const int direction = seek.currentState.x > kDeadzone ? 1 : (seek.currentState.x < -kDeadzone ? -1 : 0);
+    if (direction != s.lastSeekDirection) {
+      if (direction > 0) DispatchInput(env, kInputSeekForward);
+      if (direction < 0) DispatchInput(env, kInputSeekBackward);
+      s.lastSeekDirection = direction;
     }
   }
 }
@@ -335,6 +466,45 @@ void SubmitFrame(Session& s) {
   xrEndFrame(s.session, &endInfo);
 }
 
+// Tells Kotlin the session is over so the activity can finish and give the
+// viewer back to the panel. Without this the frame loop stops while the
+// activity stays up showing nothing, and the only way out is killing the app.
+void NotifySessionEnded(JNIEnv* env) {
+  jclass cls = env->FindClass("com/edde746/plezy/xr/ImmersiveSession");
+  if (cls == nullptr) {
+    env->ExceptionClear();
+    LOGE("could not find ImmersiveSession to report the session end");
+    return;
+  }
+  jmethodID method = env->GetStaticMethodID(cls, "onSessionEndedFromNative", "()V");
+  if (method == nullptr) {
+    env->ExceptionClear();
+    LOGE("could not find onSessionEndedFromNative");
+    env->DeleteLocalRef(cls);
+    return;
+  }
+  env->CallStaticVoidMethod(cls, method);
+  if (env->ExceptionCheck()) env->ExceptionClear();
+  env->DeleteLocalRef(cls);
+}
+
+void DispatchInput(JNIEnv* env, int action) {
+  jclass cls = env->FindClass("com/edde746/plezy/xr/ImmersiveSession");
+  if (cls == nullptr) {
+    env->ExceptionClear();
+    return;
+  }
+  jmethodID method = env->GetStaticMethodID(cls, "onInputFromNative", "(I)V");
+  if (method == nullptr) {
+    env->ExceptionClear();
+    env->DeleteLocalRef(cls);
+    return;
+  }
+  env->CallStaticVoidMethod(cls, method, static_cast<jint>(action));
+  if (env->ExceptionCheck()) env->ExceptionClear();
+  env->DeleteLocalRef(cls);
+}
+
 void RunSession(Session& s) {
   JNIEnv* env = nullptr;
   if (s.vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
@@ -345,6 +515,9 @@ void RunSession(Session& s) {
 
   const bool ready = InitializeLoader(s.vm, s.activity) && CreateEgl(s) && CreateInstanceAndSystem(s) &&
                      CreateSession(s) && CreateSurfaceSwapchain(s, env);
+  // Input is not fatal: a viewer can still watch without the controllers, so a
+  // failure here logs and leaves the screen running.
+  if (ready) CreateInput(s);
   // Unblocks the caller whether or not setup worked; a null surface is how it
   // learns that it failed.
   PublishSurface(s);
@@ -355,6 +528,7 @@ void RunSession(Session& s) {
     while (!s.quit) {
       PollEvents(s);
       if (s.running) {
+        PollInput(s, env);
         SubmitFrame(s);
         if (++frames % 300 == 0) LOGI("submitted %llu frames", static_cast<unsigned long long>(frames));
       } else {
@@ -366,6 +540,7 @@ void RunSession(Session& s) {
   }
 
   if (s.running) xrEndSession(s.session);
+  if (s.actionSet != XR_NULL_HANDLE) xrDestroyActionSet(s.actionSet);
   if (s.swapchain != XR_NULL_HANDLE) xrDestroySwapchain(s.swapchain);
   if (s.space != XR_NULL_HANDLE) xrDestroySpace(s.space);
   if (s.session != XR_NULL_HANDLE) xrDestroySession(s.session);
@@ -379,6 +554,7 @@ void RunSession(Session& s) {
   s.session = XR_NULL_HANDLE;
   s.swapchain = XR_NULL_HANDLE;
   s.space = XR_NULL_HANDLE;
+  NotifySessionEnded(env);
   s.vm->DetachCurrentThread();
   LOGI("session torn down");
 }

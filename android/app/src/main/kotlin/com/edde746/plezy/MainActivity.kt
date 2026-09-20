@@ -56,6 +56,20 @@ class MainActivity : FlutterActivity() {
     private const val TAG = "MainActivity"
     private const val TEXT_INPUT_DIAGNOSTICS_ENABLED = false
 
+    const val IMMERSIVE_CHANNEL = "com.plezy/immersive"
+
+    /**
+     * Carries controller input from the immersive activity to Dart.
+     *
+     * Held statically because the immersive activity runs outside this
+     * activity's lifecycle but inside its process, and the engine it talks to
+     * is deliberately kept alive behind it. Null whenever no engine is
+     * configured, which the sender treats as "drop the input".
+     */
+    @Volatile
+    @JvmStatic
+    var immersiveInputChannel: MethodChannel? = null
+
     // Flutter's TextInputPlugin issues showSoftInput before the FlutterView is
     // the IMM's served view (the InputConnection restart is deferred to the
     // next channel message), so on TV the D-pad-driven first open is dropped
@@ -892,6 +906,12 @@ class MainActivity : FlutterActivity() {
     flutterEngine.plugins.add(MpvPlayerPlugin())
     flutterEngine.plugins.add(ExoPlayerPlugin())
     flutterEngine.plugins.add(MpvAudioPlayerPlugin())
+
+    // Reachable from the immersive activity, which has no route to the engine's
+    // plugins but must drive the same playback state. Sending input to Dart
+    // rather than to the player core keeps Dart the single source of truth, so
+    // progress reporting and the panel's controls stay in step.
+    immersiveInputChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, IMMERSIVE_CHANNEL)
 
     MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DEVICE_CHANNEL).setMethodCallHandler { call, result ->
       when (call.method) {

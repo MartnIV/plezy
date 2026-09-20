@@ -44,6 +44,7 @@ import 'services/agent_control_service.dart';
 import 'widgets/agent_control_scope.dart';
 import 'widgets/settings_builder.dart';
 import 'utils/platform_detector.dart';
+import 'utils/immersive_playback.dart';
 import 'utils/pointer_scroll_axis.dart';
 import 'services/apple_tv_remote_touch_service.dart';
 import 'services/discord_rpc_service.dart';
@@ -1558,6 +1559,11 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     switch (state) {
       case AppLifecycleState.resumed:
+        // The panel is in charge of the picture again, so a later backgrounding
+        // means the viewer really did leave and playback should pause as usual.
+        // Cleared here rather than by the immersive activity because it is the
+        // panel coming forward that ends the hand-off, however it ended.
+        ImmersivePlayback.markEnded();
         // App came back to foreground - trigger sync check
         _offlineWatchSyncService.onAppResumed();
         unawaited(TrackerCoordinator.instance.flushWriteQueue());

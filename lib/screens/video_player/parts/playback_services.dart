@@ -518,6 +518,7 @@ extension _VideoPlayerPlaybackServiceMethods on VideoPlayerScreenState {
     _mediaControlsManager = mediaControlsManager;
 
     final mediaControlRouter = _buildMediaControlRouter();
+    _bindImmersiveControls(mediaControlRouter);
 
     // Set up media control event handling
     _mediaControlSubscriptions.add(
@@ -598,6 +599,35 @@ extension _VideoPlayerPlaybackServiceMethods on VideoPlayerScreenState {
   }
 
   /// The screen's authorization + command policy for OS media-session events.
+  /// Lets the headset's controllers drive playback while the panel is
+  /// backgrounded behind the immersive screen.
+  ///
+  /// The input is turned into the same events an OS media button or the
+  /// companion remote produces and handed to the same router, so it inherits
+  /// the `canControlPlayback` gate and every consequence the existing paths
+  /// already have -- progress reporting, the panel's own controls, Watch
+  /// Together. A controller that drove the player directly would leave all of
+  /// them describing a film that is not playing.
+  void _bindImmersiveControls(MediaControlRouter router) {
+    if (!PlatformDetector.isVR()) return;
+    immersiveControlChannel.setMethodCallHandler((call) async {
+      switch (call.method) {
+        case 'playPause':
+          router.route(const TogglePlayPauseEvent());
+        case 'seekForward':
+          router.route(const SkipForwardEvent(null));
+        case 'seekBackward':
+          router.route(const SkipBackwardEvent(null));
+      }
+      return null;
+    });
+  }
+
+  void _unbindImmersiveControls() {
+    if (!PlatformDetector.isVR()) return;
+    immersiveControlChannel.setMethodCallHandler(null);
+  }
+
   MediaControlRouter _buildMediaControlRouter() {
     return MediaControlRouter(
       // Authority stays Watch Together's. The automotive gate lives in the

@@ -88,6 +88,7 @@ import '../utils/immersive_mode_guard.dart';
 import '../utils/live_tv_player_navigation.dart';
 import '../utils/player_utils.dart';
 import '../utils/orientation_helper.dart';
+import '../utils/device_channel.dart';
 import '../utils/immersive_playback.dart';
 import '../utils/platform_detector.dart';
 import '../utils/provider_extensions.dart';
@@ -782,6 +783,10 @@ class VideoPlayerScreenState extends State<VideoPlayerScreen>
     if (includeMediaControls) {
       subscriptions.addAll(_mediaControlSubscriptions);
       _mediaControlSubscriptions.clear();
+      // Released with them: the headset's controllers drive playback through
+      // the same router, so the handler must not outlive it and reach a
+      // player this screen no longer owns.
+      _unbindImmersiveControls();
     }
     return [for (final subscription in subscriptions) subscription.cancel()];
   }

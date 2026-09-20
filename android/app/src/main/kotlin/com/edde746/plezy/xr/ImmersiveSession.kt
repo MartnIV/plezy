@@ -1,12 +1,16 @@
 package com.edde746.plezy.xr
 
 import android.app.Activity
+import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Surface
+import com.edde746.plezy.MainActivity
 import com.edde746.plezy.mpv.ActiveVideoPlayer
 
 /**
@@ -35,6 +39,57 @@ object ImmersiveSession {
   external fun nativeStop()
 
   private var loaded = false
+
+  /**
+   * Notified when the runtime ends the session -- the Meta button, the headset
+   * coming off, the system menu. The activity has to finish itself then:
+   * otherwise the frame loop stops while the activity stays up showing
+   * nothing, and the only way out is force-killing the app.
+   */
+  @Volatile
+  var onSessionEnded: (() -> Unit)? = null
+
+  /** Called from the session thread in immersive_session.cpp. */
+  @JvmStatic
+  fun onSessionEndedFromNative() {
+    onSessionEnded?.invoke()
+  }
+
+  // Mirrors the action codes in immersive_session.cpp.
+  const val INPUT_PLAY_PAUSE = 1
+  const val INPUT_SEEK_BACKWARD = 2
+  const val INPUT_SEEK_FORWARD = 3
+  const val INPUT_EXIT = 4
+
+  /**
+   * Controller input, called from the session thread.
+   *
+   * Playback actions go to Dart rather than straight to the player core: Dart
+   * owns the playback state, the progress reporting and the panel's own
+   * controls, and driving the core directly behind its back would leave all
+   * three disagreeing about whether the film is playing.
+   */
+  @JvmStatic
+  fun onInputFromNative(action: Int) {
+    if (action == INPUT_EXIT) {
+      onSessionEnded?.invoke()
+      return
+    }
+    val method = when (action) {
+      INPUT_PLAY_PAUSE -> "playPause"
+      INPUT_SEEK_BACKWARD -> "seekBackward"
+      INPUT_SEEK_FORWARD -> "seekForward"
+      else -> return
+    }
+    val channel = MainActivity.immersiveInputChannel ?: return
+    Handler(Looper.getMainLooper()).post {
+      try {
+        channel.invokeMethod(method, null)
+      } catch (error: Throwable) {
+        Log.w(TAG, "could not deliver immersive input: $method", error)
+      }
+    }
+  }
 
   @Synchronized
   fun start(activity: Activity, width: Int = DEFAULT_WIDTH, height: Int = DEFAULT_HEIGHT): Surface? {
@@ -83,6 +138,7 @@ class ImmersivePlayerActivity : Activity() {
       return
     }
     surface = started
+    ImmersiveSession.onSessionEnded = { runOnUiThread { returnToPanel() } }
 
     val core = ActiveVideoPlayer.current()
     if (core != null) {
@@ -134,8 +190,32 @@ class ImmersivePlayerActivity : Activity() {
     Log.i(TAG, "test pattern posted to the swapchain surface")
   }
 
+  /**
+   * Gives the viewer back to the 2D panel.
+   *
+   * The panel activity was never finished -- it owns the FlutterEngine and the
+   * player -- so it is still sitting in its task and only needs bringing
+   * forward. Leaving without this drops the viewer into the shell with Plezy
+   * apparently gone, which is what made exiting feel broken.
+   */
+  private fun returnToPanel() {
+    if (isFinishing || isDestroyed) return
+    try {
+      startActivity(
+        Intent(this, MainActivity::class.java).apply {
+          action = Intent.ACTION_MAIN
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+        }
+      )
+    } catch (error: Throwable) {
+      Log.w(TAG, "could not bring the panel back", error)
+    }
+    finish()
+  }
+
   override fun onDestroy() {
     super.onDestroy()
+    ImmersiveSession.onSessionEnded = null
     // Order matters: the player has to let go of the swapchain surface before
     // the session tears it down, or mpv keeps writing into freed buffers.
     if (attachedToPlayer) {

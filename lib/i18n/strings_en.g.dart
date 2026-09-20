@@ -2117,6 +2117,9 @@ class Translations$videoControls$en {
 	/// en: 'Picture-in-Picture mode'
 	String get pipButton => 'Picture-in-Picture mode';
 
+	/// en: 'Watch on the big screen'
+	String get watchInVrButton => 'Watch on the big screen';
+
 	/// en: 'Aspect ratio'
 	String get aspectRatioButton => 'Aspect ratio';
 
@@ -7774,6 +7777,7 @@ extension on Translations {
 			'videoControls.transcodeUnavailableFallback' => 'Transcoding unavailable — playing original quality',
 			'videoControls.subtitleUnavailableFallback' => 'Selected subtitles could not be loaded — continuing without subtitles',
 			'videoControls.pipButton' => 'Picture-in-Picture mode',
+			'videoControls.watchInVrButton' => 'Watch on the big screen',
 			'videoControls.aspectRatioButton' => 'Aspect ratio',
 			'videoControls.ambientLighting' => 'Ambient lighting',
 			'videoControls.fullscreenButton' => 'Enter fullscreen',
@@ -8124,9 +8128,9 @@ extension on Translations {
 			'libraries.manageLibraries' => 'Manage Libraries',
 			'libraries.sort' => 'Sort',
 			'libraries.sortBy' => 'Sort By',
-			'libraries.filters' => 'Filters',
 			_ => null,
 		} ?? switch (path) {
+			'libraries.filters' => 'Filters',
 			'libraries.confirmActionMessage' => 'Are you sure you want to perform this action?',
 			'libraries.showLibrary' => 'Show library',
 			'libraries.hideLibrary' => 'Hide library',
@@ -8638,9 +8642,9 @@ extension on Translations {
 			'downloads.storageFull' => 'Downloads stopped to protect available storage. Free some space or choose another download location, then retry.',
 			'downloads.storageUnavailable' => 'Downloads stopped because available storage could not be checked. Check the download location, then retry.',
 			'downloads.episodesQueued' => ({required Object count}) => '${count} episodes queued for download',
-			'downloads.downloadDeleted' => 'Download deleted',
 			_ => null,
 		} ?? switch (path) {
+			'downloads.downloadDeleted' => 'Download deleted',
 			'downloads.deleteConfirm' => ({required Object title}) => 'Delete "${title}" from this device?',
 			'downloads.cancelledDownloadTitle' => 'Canceled Download',
 			'downloads.cancelledDownloadMessage' => 'This download was canceled. What would you like to do?',

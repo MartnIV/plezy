@@ -17,6 +17,26 @@ void main() {
     expect(shouldPauseVideoForBackground(isHandheld: false, isTv: false, isAutomotive: false), isFalse);
   });
 
+  test('an immersive hand-off keeps playing though the panel backgrounds', () {
+    // In a headset the panel is backgrounded *by* the hand-off to the immersive
+    // player and the viewer is still watching, so the form-factor rules that
+    // would otherwise pause it must not apply.
+    expect(
+      shouldPauseVideoForBackground(isHandheld: true, isTv: false, isAutomotive: false, isImmersivePlayback: true),
+      isFalse,
+    );
+    expect(
+      shouldPauseVideoForBackground(isHandheld: false, isTv: true, isAutomotive: false, isImmersivePlayback: true),
+      isFalse,
+    );
+    // Automotive is untouched by this: a car is never a headset, so
+    // ImmersivePlayback.start() refuses there and the flag is never set.
+    expect(
+      shouldPauseVideoForBackground(isHandheld: false, isTv: false, isAutomotive: true, isImmersivePlayback: false),
+      isTrue,
+    );
+  });
+
   test('automotive playback is allowed only while resumed', () {
     expect(automotivePlaybackAllowed(isAutomotive: true, state: AppLifecycleState.resumed), isTrue);
     expect(automotivePlaybackAllowed(isAutomotive: true, state: AppLifecycleState.inactive), isFalse);

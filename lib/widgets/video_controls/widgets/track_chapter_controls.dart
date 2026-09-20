@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:material_symbols_icons/symbols.dart';
 import 'package:flutter/services.dart';
@@ -6,6 +7,7 @@ import '../../../focus/dpad_navigator.dart';
 import '../../../mpv/mpv.dart';
 import '../../../media/media_source_info.dart';
 import '../../../services/sleep_timer_service.dart';
+import '../../../utils/immersive_playback.dart';
 import '../../../utils/platform_detector.dart';
 import '../../../utils/quality_preset_labels.dart';
 import '../../../i18n/strings.g.dart';
@@ -278,6 +280,26 @@ class TrackChapterControls extends StatelessWidget {
               semanticLabel: t.videoControls.pipButton,
               buttons: buttons,
               onPressed: state.onTogglePIPMode,
+            ),
+          );
+          buttonIndex++;
+        }
+
+        // Hands the picture to the headset's immersive player. No callback is
+        // threaded for it: the hand-off has to start from Dart and set its flag
+        // before the activity launches, because Android pauses this activity
+        // before the immersive one is created, so it is a direct call rather
+        // than something the player screen passes down.
+        if (PlatformDetector.isVR()) {
+          final currentIndex = buttonIndex;
+          buttons.add(
+            _buildTrackButton(
+              buttonIndex: currentIndex,
+              icon: Symbols.view_in_ar_rounded,
+              tooltip: t.videoControls.watchInVrButton,
+              semanticLabel: t.videoControls.watchInVrButton,
+              buttons: buttons,
+              onPressed: () => unawaited(ImmersivePlayback.start()),
             ),
           );
           buttonIndex++;

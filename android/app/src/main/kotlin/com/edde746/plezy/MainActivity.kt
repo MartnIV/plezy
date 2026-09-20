@@ -37,6 +37,7 @@ import com.edde746.plezy.shared.DeviceQuirks
 import com.edde746.plezy.shared.MediaCodecQuery
 import com.edde746.plezy.shared.ThemeHelper
 import com.edde746.plezy.watchnext.WatchNextPlugin
+import com.edde746.plezy.xr.ImmersivePlayerActivity
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.android.FlutterTextureView
 import io.flutter.embedding.android.RenderMode
@@ -287,6 +288,29 @@ class MainActivity : FlutterActivity() {
     }
     logTextInputDiag { "consuming leaked IME key ${describeKeyEvent(event)} budget=$imeLeakRestartBudget" }
     return true
+  }
+
+  /**
+   * Starts the immersive player activity, leaving this one backgrounded.
+   *
+   * Deliberately not finishAndRemoveTask(), which Meta's hybrid-app guidance
+   * suggests: this activity owns the FlutterEngine, and the player with it, so
+   * finishing it would end the playback it is handing over.
+   */
+  private fun startImmersivePlayback(): Boolean {
+    if (!TvDetection.isVr(this)) return false
+    return try {
+      startActivity(
+        Intent(this, ImmersivePlayerActivity::class.java).apply {
+          action = Intent.ACTION_MAIN
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+      )
+      true
+    } catch (error: Throwable) {
+      Log.e("MainActivity", "could not start immersive playback", error)
+      false
+    }
   }
 
   private fun getAndroidTvDetection(): Map<String, Any> {
@@ -872,6 +896,12 @@ class MainActivity : FlutterActivity() {
     MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DEVICE_CHANNEL).setMethodCallHandler { call, result ->
       when (call.method) {
         "getTvDetection" -> result.success(getAndroidTvDetection())
+        // Hands playback over to the headset. Dart starts this, not the
+        // immersive activity itself, because Android runs this activity's
+        // onPause *before* the new activity's onCreate -- so anything the
+        // immersive side sets would arrive after the lifecycle handler has
+        // already decided whether to pause.
+        "startImmersivePlayback" -> result.success(startImmersivePlayback())
         "getDeviceName" -> result.success(getDeviceName())
         "getPerformanceSignals" -> result.success(getPerformanceSignals())
         "getVideoDecodeCapabilities" -> result.success(MediaCodecQuery.hardwareVideoDecodeSupport())

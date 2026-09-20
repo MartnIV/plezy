@@ -716,6 +716,7 @@
     "transcodeUnavailableFallback": "Transcoding unavailable — playing original quality",
     "subtitleUnavailableFallback": "Selected subtitles could not be loaded — continuing without subtitles",
     "pipButton": "Picture-in-Picture mode",
+    "watchInVrButton": "Watch on the big screen",
     "aspectRatioButton": "Aspect ratio",
     "ambientLighting": "Ambient lighting",
     "fullscreenButton": "Enter fullscreen",

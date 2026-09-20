@@ -88,6 +88,7 @@ import '../utils/immersive_mode_guard.dart';
 import '../utils/live_tv_player_navigation.dart';
 import '../utils/player_utils.dart';
 import '../utils/orientation_helper.dart';
+import '../utils/immersive_playback.dart';
 import '../utils/platform_detector.dart';
 import '../utils/provider_extensions.dart';
 import '../utils/snackbar_helper.dart';

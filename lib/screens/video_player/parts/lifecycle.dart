@@ -1,7 +1,17 @@
 part of '../../video_player_screen.dart';
 
-bool shouldPauseVideoForBackground({required bool isHandheld, required bool isTv, required bool isAutomotive}) =>
-    isHandheld || isTv || isAutomotive;
+/// Whether backgrounding the app should pause the picture.
+///
+/// [isImmersivePlayback] is the exception that is not about the form factor: in
+/// a headset the panel is backgrounded *by* the hand-off to the immersive
+/// player, and the viewer is still watching. Pausing there would stop the film
+/// at the moment it reached the big screen.
+bool shouldPauseVideoForBackground({
+  required bool isHandheld,
+  required bool isTv,
+  required bool isAutomotive,
+  bool isImmersivePlayback = false,
+}) => !isImmersivePlayback && (isHandheld || isTv || isAutomotive);
 
 extension _VideoPlayerLifecycleMethods on VideoPlayerScreenState {
   void _enqueueLifecycleTransition(String label, Future<void> Function() transition) {
@@ -101,6 +111,7 @@ extension _VideoPlayerLifecycleMethods on VideoPlayerScreenState {
       isHandheld: PlatformDetector.isMobile(context),
       isTv: isTv,
       isAutomotive: isAutomotive,
+      isImmersivePlayback: ImmersivePlayback.isActive,
     );
 
     // Pause first so Android MPV does not keep decoding against a transient

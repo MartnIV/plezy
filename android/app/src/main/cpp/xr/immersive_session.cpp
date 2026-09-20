@@ -49,6 +49,15 @@ constexpr float kScreenCentralAngleRadians = 1.22173f;  // 70 degrees
 constexpr float kScreenAspectRatio = 16.0f / 9.0f;
 constexpr float kScreenHeightOffsetMeters = 0.0f;
 
+// The control bar. Closer than the screen and below the eye line, so reading it
+// is a glance down rather than a refocus across the whole picture, and it never
+// covers the film.
+constexpr float kOsdDistanceMeters = 2.6f;
+constexpr float kOsdHeightOffsetMeters = -0.75f;
+constexpr float kOsdWidthMeters = 1.6f;
+constexpr int kOsdPixelWidth = 1024;
+constexpr int kOsdPixelHeight = 192;
+
 struct Session {
   JavaVM* vm = nullptr;
   jobject activity = nullptr;  // global ref
@@ -58,6 +67,9 @@ struct Session {
   XrSession session = XR_NULL_HANDLE;
   XrSpace space = XR_NULL_HANDLE;
   XrSwapchain swapchain = XR_NULL_HANDLE;
+  XrSwapchain osdSwapchain = XR_NULL_HANDLE;
+  jobject osdSurface = nullptr;  // global ref
+  std::atomic<bool> osdVisible{false};
   XrSessionState state = XR_SESSION_STATE_UNKNOWN;
 
   // Controller input. The Touch controllers are not Android input devices --
@@ -329,6 +341,32 @@ bool CreateSurfaceSwapchain(Session& s, JNIEnv* env) {
   }
   s.surface = env->NewGlobalRef(localSurface);
   LOGI("surface swapchain ready %dx%d", s.width, s.height);
+
+  // The control bar gets its own swapchain rather than being drawn into the
+  // picture: the video surface is written by MediaCodec frame by frame, so
+  // anything composited into it would be overwritten immediately, and keeping
+  // them apart also means the bar can appear and disappear without touching
+  // the film.
+  XrSwapchainCreateInfo osdInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+  osdInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+  osdInfo.width = kOsdPixelWidth;
+  osdInfo.height = kOsdPixelHeight;
+  osdInfo.format = 0;
+  osdInfo.faceCount = 0;
+  osdInfo.arraySize = 0;
+  osdInfo.mipCount = 0;
+  osdInfo.sampleCount = 0;
+
+  jobject localOsdSurface = nullptr;
+  const XrResult osdResult = createSurfaceSwapchain(s.session, &osdInfo, &s.osdSwapchain, &localOsdSurface);
+  if (XR_FAILED(osdResult) || localOsdSurface == nullptr) {
+    // Not fatal: the film is still watchable without a control bar.
+    LOGE("could not create the OSD swapchain: %d", osdResult);
+    s.osdSwapchain = XR_NULL_HANDLE;
+    return true;
+  }
+  s.osdSurface = env->NewGlobalRef(localOsdSurface);
+  LOGI("osd swapchain ready %dx%d", kOsdPixelWidth, kOsdPixelHeight);
   return true;
 }
 
@@ -454,14 +492,39 @@ void SubmitFrame(Session& s) {
   cylinder.centralAngle = kScreenCentralAngleRadians;
   cylinder.aspectRatio = kScreenAspectRatio;
 
-  const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&cylinder)};
+  // The control bar, composited over the film. Later layers draw on top, so
+  // the order here is what puts it in front rather than behind.
+  XrCompositionLayerImageLayoutFB osdLayout{XR_TYPE_COMPOSITION_LAYER_IMAGE_LAYOUT_FB};
+  osdLayout.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
+
+  XrCompositionLayerQuad osd{XR_TYPE_COMPOSITION_LAYER_QUAD};
+  osd.next = &osdLayout;
+  // Unpremultiplied: Canvas hands back straight alpha, and claiming it is
+  // premultiplied darkens every edge in the bar.
+  osd.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                   XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+  osd.space = s.space;
+  osd.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+  osd.subImage.swapchain = s.osdSwapchain;
+  osd.subImage.imageRect.offset = {0, 0};
+  osd.subImage.imageRect.extent = {kOsdPixelWidth, kOsdPixelHeight};
+  osd.subImage.imageArrayIndex = 0;
+  osd.pose.orientation.w = 1.0f;
+  osd.pose.position = {0.0f, kOsdHeightOffsetMeters, -kOsdDistanceMeters};
+  osd.size = {kOsdWidthMeters, kOsdWidthMeters * kOsdPixelHeight / kOsdPixelWidth};
+
+  const bool showOsd = s.osdSwapchain != XR_NULL_HANDLE && s.osdVisible.load();
+  const XrCompositionLayerBaseHeader* layers[] = {
+      reinterpret_cast<XrCompositionLayerBaseHeader*>(&cylinder),
+      reinterpret_cast<XrCompositionLayerBaseHeader*>(&osd),
+  };
 
   XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
   endInfo.displayTime = frameState.predictedDisplayTime;
   endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
   // shouldRender is false while the session is visible but occluded (the system
   // menu is up); submitting no layers then is what the spec asks for.
-  endInfo.layerCount = frameState.shouldRender ? 1 : 0;
+  endInfo.layerCount = frameState.shouldRender ? (showOsd ? 2 : 1) : 0;
   endInfo.layers = frameState.shouldRender ? layers : nullptr;
   xrEndFrame(s.session, &endInfo);
 }
@@ -541,13 +604,17 @@ void RunSession(Session& s) {
 
   if (s.running) xrEndSession(s.session);
   if (s.actionSet != XR_NULL_HANDLE) xrDestroyActionSet(s.actionSet);
+  if (s.osdSwapchain != XR_NULL_HANDLE) xrDestroySwapchain(s.osdSwapchain);
   if (s.swapchain != XR_NULL_HANDLE) xrDestroySwapchain(s.swapchain);
   if (s.space != XR_NULL_HANDLE) xrDestroySpace(s.space);
   if (s.session != XR_NULL_HANDLE) xrDestroySession(s.session);
   if (s.instance != XR_NULL_HANDLE) xrDestroyInstance(s.instance);
   DestroyEgl(s);
+  if (s.osdSurface != nullptr) env->DeleteGlobalRef(s.osdSurface);
   if (s.surface != nullptr) env->DeleteGlobalRef(s.surface);
   if (s.activity != nullptr) env->DeleteGlobalRef(s.activity);
+  s.osdSurface = nullptr;
+  s.osdSwapchain = XR_NULL_HANDLE;
   s.surface = nullptr;
   s.activity = nullptr;
   s.instance = XR_NULL_HANDLE;
@@ -580,6 +647,16 @@ extern "C" JNIEXPORT jobject JNICALL Java_com_edde746_plezy_xr_ImmersiveSession_
   std::unique_lock<std::mutex> lock(s.surfaceMutex);
   s.surfaceReady.wait(lock, [&s]() { return s.surfaceResolved; });
   return s.surface;  // null when setup failed
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_edde746_plezy_xr_ImmersiveSession_nativeOsdSurface(JNIEnv*, jclass) {
+  return g_session.osdSurface;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_edde746_plezy_xr_ImmersiveSession_nativeSetOsdVisible(JNIEnv*, jclass, jboolean visible) {
+  g_session.osdVisible.store(visible == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_edde746_plezy_xr_ImmersiveSession_nativeStop(JNIEnv*, jclass) {

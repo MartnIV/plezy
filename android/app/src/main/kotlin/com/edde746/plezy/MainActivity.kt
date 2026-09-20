@@ -37,7 +37,9 @@ import com.edde746.plezy.shared.DeviceQuirks
 import com.edde746.plezy.shared.MediaCodecQuery
 import com.edde746.plezy.shared.ThemeHelper
 import com.edde746.plezy.watchnext.WatchNextPlugin
+import com.edde746.plezy.xr.ImmersivePlaybackStatus
 import com.edde746.plezy.xr.ImmersivePlayerActivity
+import com.edde746.plezy.xr.ImmersiveSession
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.android.FlutterTextureView
 import io.flutter.embedding.android.RenderMode
@@ -911,7 +913,34 @@ class MainActivity : FlutterActivity() {
     // plugins but must drive the same playback state. Sending input to Dart
     // rather than to the player core keeps Dart the single source of truth, so
     // progress reporting and the panel's controls stay in step.
-    immersiveInputChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, IMMERSIVE_CHANNEL)
+    immersiveInputChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, IMMERSIVE_CHANNEL).also {
+      // The same channel the other way: Dart owns playback state, so it pushes
+      // what the immersive control bar should say rather than the bar trying
+      // to read it out of the player behind Dart's back.
+      it.setMethodCallHandler { call, result ->
+        when (call.method) {
+          "updateStatus", "showStatus" -> {
+            val status = ImmersivePlaybackStatus(
+              isPlaying = call.argument<Boolean>("isPlaying") ?: false,
+              positionMs = (call.argument<Number>("positionMs") ?: 0).toLong(),
+              durationMs = (call.argument<Number>("durationMs") ?: 0).toLong(),
+              title = call.argument<String>("title").orEmpty(),
+            )
+            if (call.method == "showStatus") {
+              ImmersiveSession.showOsd(status)
+            } else {
+              ImmersiveSession.updateOsd(status)
+            }
+            result.success(null)
+          }
+          "hideStatus" -> {
+            ImmersiveSession.hideOsd()
+            result.success(null)
+          }
+          else -> result.notImplemented()
+        }
+      }
+    }
 
     MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DEVICE_CHANNEL).setMethodCallHandler { call, result ->
       when (call.method) {

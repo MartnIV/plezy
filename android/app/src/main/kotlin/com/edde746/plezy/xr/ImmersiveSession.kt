@@ -38,6 +38,54 @@ object ImmersiveSession {
   @JvmStatic
   external fun nativeStop()
 
+  @JvmStatic
+  external fun nativeOsdSurface(): Surface?
+
+  @JvmStatic
+  external fun nativeSetOsdVisible(visible: Boolean)
+
+  /**
+   * Shows the control bar and starts the countdown to hiding it again.
+   *
+   * Auto-hiding matters more here than on a screen: the bar floats in the
+   * room, so leaving it up puts a permanent object in the viewer's field of
+   * view for a two-hour film.
+   */
+  private val osdHandler = Handler(Looper.getMainLooper())
+  private var osdHideRunnable: Runnable? = null
+  private const val OSD_VISIBLE_MS = 4_000L
+
+  @Volatile
+  private var lastStatus: ImmersivePlaybackStatus? = null
+
+  @Synchronized
+  fun showOsd(status: ImmersivePlaybackStatus, autoHide: Boolean = true) {
+    lastStatus = status
+    val surface = nativeOsdSurface() ?: return
+    ImmersiveOsd.draw(surface, status)
+    nativeSetOsdVisible(true)
+    osdHideRunnable?.let(osdHandler::removeCallbacks)
+    if (!autoHide) return
+    val hide = Runnable { nativeSetOsdVisible(false) }
+    osdHideRunnable = hide
+    osdHandler.postDelayed(hide, OSD_VISIBLE_MS)
+  }
+
+  /** Redraws without disturbing the hide countdown, for ticking the clock. */
+  @Synchronized
+  fun updateOsd(status: ImmersivePlaybackStatus) {
+    lastStatus = status
+    val surface = nativeOsdSurface() ?: return
+    ImmersiveOsd.draw(surface, status)
+  }
+
+  @Synchronized
+  fun hideOsd() {
+    osdHideRunnable?.let(osdHandler::removeCallbacks)
+    osdHideRunnable = null
+    nativeSetOsdVisible(false)
+  }
+
   private var loaded = false
 
   /**
@@ -81,6 +129,9 @@ object ImmersiveSession {
       INPUT_SEEK_FORWARD -> "seekForward"
       else -> return
     }
+    // Any press brings the bar back: pressing a button and seeing nothing
+    // change is the worst outcome when there is no other feedback.
+    lastStatus?.let { showOsd(it) }
     val channel = MainActivity.immersiveInputChannel ?: return
     Handler(Looper.getMainLooper()).post {
       try {

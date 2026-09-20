@@ -890,6 +890,17 @@ class VideoPlayerScreenState extends State<VideoPlayerScreen>
 
   // App lifecycle state tracking
   bool _wasPlayingBeforeInactive = false;
+
+  /// The most recent title pushed to the headset's control bar, so a position
+  /// tick does not have to reach back into the metadata for it.
+  ///
+  /// Declared here rather than beside its use in the playback-services part:
+  /// those parts are extensions, and an extension cannot hold instance state.
+  String _immersiveTitle = '';
+
+  /// Whether the previous position tick was already on the big screen, so the
+  /// arrival can be told apart from the ticks that follow it.
+  bool _immersiveWasActive = false;
   bool _hiddenForBackground = false;
   bool _resumeAfterAppleAudioSessionPause = false;
   DateTime? _lastPlaybackPauseAt;

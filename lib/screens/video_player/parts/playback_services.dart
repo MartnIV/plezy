@@ -398,6 +398,7 @@ extension _VideoPlayerPlaybackServiceMethods on VideoPlayerScreenState {
     // Media controls metadata. Fire-and-forget — the OS plugin downloads
     // the poster synchronously inside `setMetadata` (~270 ms); the
     // controls populate a beat after first frame which is fine.
+    _immersiveTitle = metadata.displayTitle;
     if (_mediaControlsManager != null) {
       unawaited(
         _mediaControlsManager!.updateMetadata(
@@ -570,6 +571,19 @@ extension _VideoPlayerPlaybackServiceMethods on VideoPlayerScreenState {
           position: position,
           speed: currentPlayer.state.rate,
         );
+        // Keep the headset's control bar honest about where we are. Only
+        // while it is actually showing: this fires on every position tick,
+        // and a channel call per tick for a bar nobody is looking at is pure
+        // waste.
+        if (ImmersivePlayback.isActive) {
+          // The first tick after the hand-off shows the bar rather than just
+          // updating it, so arriving on the big screen tells the viewer what
+          // they are watching and where they are, then gets out of the way.
+          _pushImmersiveStatus(currentPlayer, position, show: !_immersiveWasActive);
+          _immersiveWasActive = true;
+        } else {
+          _immersiveWasActive = false;
+        }
         // Live reports through [_sendLiveTimeline] alone; Discord and the
         // trackers were never started for it.
         if (widget.isLive) return;
@@ -599,6 +613,24 @@ extension _VideoPlayerPlaybackServiceMethods on VideoPlayerScreenState {
   }
 
   /// The screen's authorization + command policy for OS media-session events.
+  void _pushImmersiveStatus(dynamic currentPlayer, Duration position, {bool show = false}) {
+    if (!PlatformDetector.isVR()) return;
+    unawaited(
+      immersiveControlChannel
+          .invokeMethod<void>(show ? 'showStatus' : 'updateStatus', <String, dynamic>{
+            'isPlaying': currentPlayer.state.isActive as bool,
+            'positionMs': position.inMilliseconds,
+            'durationMs': (currentPlayer.state.duration as Duration).inMilliseconds,
+            'title': _immersiveTitle,
+          })
+          .catchError((Object error) {
+            // The immersive activity may already be gone; the bar is not worth
+            // surfacing an error over.
+            appLogger.d('Immersive status push failed: $error');
+          }),
+    );
+  }
+
   /// Lets the headset's controllers drive playback while the panel is
   /// backgrounded behind the immersive screen.
   ///

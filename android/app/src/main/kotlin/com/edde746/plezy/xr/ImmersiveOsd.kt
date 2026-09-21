@@ -53,7 +53,12 @@ object ImmersiveOsd {
     color = Color.WHITE
   }
 
-  fun draw(target: Surface, status: ImmersivePlaybackStatus) {
+  /**
+   * [notice] replaces the title line for a moment after something changes that
+   * has no other visible effect -- the 3D layout above all, which otherwise
+   * has to be cycled blind and judged by whether the picture looks wrong.
+   */
+  fun draw(target: Surface, status: ImmersivePlaybackStatus, notice: String? = null) {
     val canvas: Canvas = try {
       target.lockCanvas(null)
     } catch (error: Throwable) {
@@ -96,8 +101,11 @@ object ImmersiveOsd {
       textPaint.textSize = h * 0.20f
       textPaint.textAlign = Paint.Align.LEFT
       val titleX = glyphCentreX + glyphSize
-      val title = ellipsize(status.title, textPaint, w - titleX - padding * 6f)
+      val headline = notice ?: status.title
+      if (notice != null) textPaint.color = Color.rgb(150, 200, 255)
+      val title = ellipsize(headline, textPaint, w - titleX - padding * 6f)
       canvas.drawText(title, titleX, h * 0.36f, textPaint)
+      textPaint.color = Color.WHITE
 
       textPaint.textSize = h * 0.17f
       textPaint.textAlign = Paint.Align.RIGHT

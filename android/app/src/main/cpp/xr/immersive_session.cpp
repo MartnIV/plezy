@@ -58,6 +58,11 @@ constexpr float kOsdWidthMeters = 1.6f;
 constexpr int kOsdPixelWidth = 1024;
 constexpr int kOsdPixelHeight = 192;
 
+// How a 3D film packs both eyes into one picture. Nothing detects this: the
+// container rarely says, and guessing wrong is worse than asking, so the
+// viewer cycles it and sees the result immediately.
+enum class StereoMode { Mono = 0, SideBySide = 1, TopBottom = 2 };
+
 struct Session {
   JavaVM* vm = nullptr;
   jobject activity = nullptr;  // global ref
@@ -88,6 +93,8 @@ struct Session {
   XrAction exitAction = XR_NULL_HANDLE;
   XrAction seekAction = XR_NULL_HANDLE;
   XrAction recenterAction = XR_NULL_HANDLE;
+  XrAction stereoAction = XR_NULL_HANDLE;
+  std::atomic<int> stereoMode{static_cast<int>(StereoMode::Mono)};
   bool actionsAttached = false;
   // Rising-edge latch for the stick, so holding it does not spray seeks.
   int lastSeekDirection = 0;
@@ -321,6 +328,10 @@ constexpr int kInputPlayPause = 1;
 constexpr int kInputSeekBackward = 2;
 constexpr int kInputSeekForward = 3;
 constexpr int kInputExit = 4;
+// 3D layout, reported as a base plus the mode so it needs no second callback
+// (and therefore no second R8 keep rule).
+constexpr int kInputStereoModeBase = 10;
+
 
 XrPath ToPath(XrInstance instance, const char* text) {
   XrPath path = XR_NULL_PATH;
@@ -348,6 +359,7 @@ bool CreateInput(Session& s) {
   if (!createAction("play_pause", "Play or pause", XR_ACTION_TYPE_BOOLEAN_INPUT, &s.playPauseAction) ||
       !createAction("exit_immersive", "Leave the big screen", XR_ACTION_TYPE_BOOLEAN_INPUT, &s.exitAction) ||
       !createAction("recenter", "Bring the screen in front of me", XR_ACTION_TYPE_BOOLEAN_INPUT, &s.recenterAction) ||
+      !createAction("stereo_mode", "Change the 3D layout", XR_ACTION_TYPE_BOOLEAN_INPUT, &s.stereoAction) ||
       !createAction("seek", "Seek", XR_ACTION_TYPE_VECTOR2F_INPUT, &s.seekAction)) {
     LOGE("could not create the player actions");
     return false;
@@ -366,6 +378,9 @@ bool CreateInput(Session& s) {
       // accident while nudging it to skip.
       {s.recenterAction, ToPath(s.instance, "/user/hand/right/input/thumbstick/click")},
       {s.recenterAction, ToPath(s.instance, "/user/hand/left/input/thumbstick/click")},
+      // Grip, which nothing else here uses.
+      {s.stereoAction, ToPath(s.instance, "/user/hand/right/input/squeeze/value")},
+      {s.stereoAction, ToPath(s.instance, "/user/hand/left/input/squeeze/value")},
   };
 
   XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
@@ -526,6 +541,12 @@ void PollInput(Session& s, JNIEnv* env) {
   // Handled here rather than through Dart: it moves the screen, which is this
   // side's business entirely and should not wait on a round trip.
   if (pressed(s.recenterAction)) s.recenterRequested.store(true);
+  if (pressed(s.stereoAction)) {
+    const int next = (s.stereoMode.load() + 1) % 3;
+    s.stereoMode.store(next);
+    LOGI("stereo mode -> %d", next);
+    DispatchInput(env, kInputStereoModeBase + next);
+  }
 
   XrActionStateGetInfo seekInfo{XR_TYPE_ACTION_STATE_GET_INFO};
   seekInfo.action = s.seekAction;
@@ -576,14 +597,33 @@ void SubmitFrame(Session& s) {
   layerSettings.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SHARPENING_BIT_FB;
   layerSettings.next = &imageLayout;
 
+  // A 3D film packs both eyes into one frame, so each eye is shown the half
+  // meant for it: same geometry, same swapchain, different source rectangle.
+  // This needs no extension -- eyeVisibility is core OpenXR -- and no second
+  // decode, which is what makes 3D nearly free here.
+  const StereoMode stereo = static_cast<StereoMode>(s.stereoMode.load());
+  XrRect2Di leftRect{{0, 0}, {s.width, s.height}};
+  XrRect2Di rightRect = leftRect;
+  switch (stereo) {
+    case StereoMode::SideBySide:
+      leftRect = {{0, 0}, {s.width / 2, s.height}};
+      rightRect = {{s.width / 2, 0}, {s.width / 2, s.height}};
+      break;
+    case StereoMode::TopBottom:
+      leftRect = {{0, 0}, {s.width, s.height / 2}};
+      rightRect = {{0, s.height / 2}, {s.width, s.height / 2}};
+      break;
+    case StereoMode::Mono:
+      break;
+  }
+
   XrCompositionLayerCylinderKHR cylinder{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
   cylinder.next = &layerSettings;
   cylinder.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
   cylinder.space = s.space;
-  cylinder.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+  cylinder.eyeVisibility = stereo == StereoMode::Mono ? XR_EYE_VISIBILITY_BOTH : XR_EYE_VISIBILITY_LEFT;
   cylinder.subImage.swapchain = s.swapchain;
-  cylinder.subImage.imageRect.offset = {0, 0};
-  cylinder.subImage.imageRect.extent = {s.width, s.height};
+  cylinder.subImage.imageRect = leftRect;
   cylinder.subImage.imageArrayIndex = 0;
   // The cylinder is centred on the viewer, so the screen sits one radius away
   // along -Z and every point of it is the same distance from the eyes.
@@ -614,18 +654,27 @@ void SubmitFrame(Session& s) {
   osd.pose.position = {0.0f, kOsdHeightOffsetMeters, -kOsdDistanceMeters};
   osd.size = {kOsdWidthMeters, kOsdWidthMeters * kOsdPixelHeight / kOsdPixelWidth};
 
+  // The right eye's half, when there is one. A copy of the left layer with the
+  // other rectangle and the other eye.
+  XrCompositionLayerCylinderKHR cylinderRight = cylinder;
+  cylinderRight.eyeVisibility = XR_EYE_VISIBILITY_RIGHT;
+  cylinderRight.subImage.imageRect = rightRect;
+
   const bool showOsd = s.osdSwapchain != XR_NULL_HANDLE && s.osdVisible.load();
-  const XrCompositionLayerBaseHeader* layers[] = {
-      reinterpret_cast<XrCompositionLayerBaseHeader*>(&cylinder),
-      reinterpret_cast<XrCompositionLayerBaseHeader*>(&osd),
-  };
+  const bool isStereo = stereo != StereoMode::Mono;
+
+  const XrCompositionLayerBaseHeader* layers[3];
+  uint32_t layerCount = 0;
+  layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&cylinder);
+  if (isStereo) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&cylinderRight);
+  if (showOsd) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&osd);
 
   XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
   endInfo.displayTime = frameState.predictedDisplayTime;
   endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
   // shouldRender is false while the session is visible but occluded (the system
   // menu is up); submitting no layers then is what the spec asks for.
-  endInfo.layerCount = frameState.shouldRender ? (showOsd ? 2 : 1) : 0;
+  endInfo.layerCount = frameState.shouldRender ? layerCount : 0;
   endInfo.layers = frameState.shouldRender ? layers : nullptr;
   xrEndFrame(s.session, &endInfo);
 }

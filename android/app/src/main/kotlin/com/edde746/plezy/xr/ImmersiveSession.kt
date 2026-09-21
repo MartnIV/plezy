@@ -77,6 +77,25 @@ object ImmersiveSession {
     osdHandler.postDelayed(hide, OSD_VISIBLE_MS)
   }
 
+  /**
+   * Shows the bar with a one-off message in place of the title.
+   *
+   * Falls back to a blank status when nothing is playing, so the 3D layout can
+   * still be cycled and seen while the bring-up pattern is up.
+   */
+  @Synchronized
+  fun showNotice(text: String) {
+    val status = lastStatus ?: ImmersivePlaybackStatus(false, 0, 0, "")
+    val surface = nativeOsdSurface() ?: return
+    ImmersiveOsd.draw(surface, status, notice = text)
+    nativeSetOsdVisible(true)
+    osdHideRunnable?.let(osdHandler::removeCallbacks)
+    val hide = Runnable { nativeSetOsdVisible(false) }
+    osdHideRunnable = hide
+    osdHandler.postDelayed(hide, OSD_VISIBLE_MS)
+    Log.i(TAG, "osd notice: $text")
+  }
+
   /** Redraws without disturbing the hide countdown, for ticking the clock. */
   @Synchronized
   fun updateOsd(status: ImmersivePlaybackStatus) {
@@ -123,10 +142,22 @@ object ImmersiveSession {
    * controls, and driving the core directly behind its back would leave all
    * three disagreeing about whether the film is playing.
    */
+  // Mirrors kInputStereoModeBase in immersive_session.cpp: the mode rides in
+  // the action code so the bridge needs no second callback, and therefore no
+  // second R8 keep rule to be forgotten later.
+  private const val INPUT_STEREO_MODE_BASE = 10
+
+  private val stereoLabels = arrayOf("2D", "3D side-by-side", "3D top/bottom")
+
   @JvmStatic
   fun onInputFromNative(action: Int) {
     if (action == INPUT_EXIT) {
       onSessionEnded?.invoke()
+      return
+    }
+    if (action >= INPUT_STEREO_MODE_BASE) {
+      val mode = action - INPUT_STEREO_MODE_BASE
+      stereoLabels.getOrNull(mode)?.let { showNotice(it) }
       return
     }
     val method = when (action) {

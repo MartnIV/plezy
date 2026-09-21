@@ -1,6 +1,7 @@
 package com.edde746.plezy.xr
 
 import android.app.Activity
+import android.app.ActivityManager
 import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Color
@@ -61,9 +62,14 @@ object ImmersiveSession {
   @Synchronized
   fun showOsd(status: ImmersivePlaybackStatus, autoHide: Boolean = true) {
     lastStatus = status
-    val surface = nativeOsdSurface() ?: return
+    val surface = nativeOsdSurface()
+    if (surface == null) {
+      Log.w(TAG, "no OSD surface; the control bar cannot be drawn")
+      return
+    }
     ImmersiveOsd.draw(surface, status)
     nativeSetOsdVisible(true)
+    Log.i(TAG, "osd shown: ${status.positionMs}/${status.durationMs} playing=${status.isPlaying}")
     osdHideRunnable?.let(osdHandler::removeCallbacks)
     if (!autoHide) return
     val hide = Runnable { nativeSetOsdVisible(false) }
@@ -244,24 +250,44 @@ class ImmersivePlayerActivity : Activity() {
   /**
    * Gives the viewer back to the 2D panel.
    *
-   * The panel activity was never finished -- it owns the FlutterEngine and the
-   * player -- so it is still sitting in its task and only needs bringing
-   * forward. Leaving without this drops the viewer into the shell with Plezy
-   * apparently gone, which is what made exiting feel broken.
+   * The panel was never finished -- it owns the FlutterEngine and the player --
+   * so it is still sitting in its own task and only needs raising. Starting it
+   * by intent instead launches a *second* copy: the panel declares an empty
+   * taskAffinity, so FLAG_ACTIVITY_NEW_TASK makes another task rather than
+   * finding the existing one, and the viewer comes back to two Plezy panels,
+   * one showing the library and one still holding the film.
+   *
+   * moveTaskToFront raises the original. The app already holds REORDER_TASKS
+   * for its own task switching.
    */
   private fun returnToPanel() {
     if (isFinishing || isDestroyed) return
-    try {
-      startActivity(
-        Intent(this, MainActivity::class.java).apply {
-          action = Intent.ACTION_MAIN
-          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-        }
-      )
-    } catch (error: Throwable) {
-      Log.w(TAG, "could not bring the panel back", error)
+    val panelTaskId = intent?.getIntExtra(EXTRA_PANEL_TASK_ID, -1) ?: -1
+    if (panelTaskId >= 0) {
+      try {
+        val activityManager = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+        activityManager.moveTaskToFront(panelTaskId, 0)
+      } catch (error: Throwable) {
+        Log.w(TAG, "could not raise the panel task", error)
+      }
     }
-    finish()
+    // Finishing removes this task, so the shell stops showing an immersive
+    // panel next to the one being returned to.
+    finishAndRemoveTask()
+  }
+
+  /**
+   * Leaving is decided here rather than from the session's state.
+   *
+   * The runtime passes through XR_SESSION_STATE_STOPPING as a matter of
+   * course -- including moments after the session starts -- so treating that
+   * as the viewer leaving killed the session almost immediately. onStop is
+   * Android telling us this activity is no longer on screen, which is the
+   * thing that actually means they have gone.
+   */
+  override fun onStop() {
+    super.onStop()
+    if (!isFinishing) returnToPanel()
   }
 
   override fun onDestroy() {
@@ -277,7 +303,10 @@ class ImmersivePlayerActivity : Activity() {
     ImmersiveSession.stop()
   }
 
-  private companion object {
-    const val TAG = "PlezyXR"
+  companion object {
+    private const val TAG = "PlezyXR"
+
+    /** The panel's task id, so leaving can raise it rather than clone it. */
+    const val EXTRA_PANEL_TASK_ID = "plezy.panel_task_id"
   }
 }

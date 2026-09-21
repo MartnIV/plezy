@@ -35,3 +35,18 @@
   private androidx.media3.extractor.ExtractorOutput extractorOutput;
   private androidx.media3.common.util.ParsableByteArray subtitleSample;
 }
+
+# The immersive player's session thread calls back into Kotlin through JNI:
+# immersive_session.cpp resolves onSessionEndedFromNative and onInputFromNative
+# with GetStaticMethodID, and nothing on the Java side ever calls them.
+#
+# R8 keeps the class because it declares native methods (the default
+# keepclasseswithmembernames rule), so FindClass and nativeStart work and the
+# problem looks like anything but shrinking. The callbacks themselves are
+# unreachable as far as R8 can tell, so they are renamed away and
+# GetStaticMethodID fails inside nativeStart -- which then aborts the process
+# with a pending NoSuchMethodError, in release builds only.
+-keepclassmembers class com.edde746.plezy.xr.ImmersiveSession {
+  public static void onSessionEndedFromNative();
+  public static void onInputFromNative(int);
+}

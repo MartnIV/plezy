@@ -320,6 +320,9 @@ class MainActivity : FlutterActivity() {
         Intent(this, ImmersivePlayerActivity::class.java).apply {
           action = Intent.ACTION_MAIN
           addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          // So the way back can raise this exact task instead of launching a
+          // second copy of the panel.
+          putExtra(ImmersivePlayerActivity.EXTRA_PANEL_TASK_ID, taskId)
         }
       )
       true

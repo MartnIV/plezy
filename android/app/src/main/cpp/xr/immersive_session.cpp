@@ -96,6 +96,15 @@ struct Session {
   std::atomic<bool> quit{false};
 
   // The Surface handed back to Kotlin, published once the swapchain exists.
+  // Cached from nativeStart, which runs on a Java thread. FindClass on the
+  // session thread would use the system class loader -- that thread was
+  // created by native code and has no app class loader -- so it cannot see
+  // this app's classes and fails silently. Every controller press was being
+  // resolved into nothing that way.
+  jclass sessionClass = nullptr;  // global ref
+  jmethodID onSessionEndedMethod = nullptr;
+  jmethodID onInputMethod = nullptr;
+
   std::mutex surfaceMutex;
   std::condition_variable surfaceReady;
   jobject surface = nullptr;  // global ref
@@ -404,11 +413,11 @@ void PollEvents(Session& s) {
       xrEndSession(s.session);
       s.running = false;
       LOGI("session ended");
-      // The runtime stops the session when the viewer leaves the app -- the
-      // Meta button, taking the headset off, the system menu. Treat it as an
-      // exit and let the activity finish, rather than sitting idle forever
-      // waiting for a READY that only comes back if they return.
-      s.quit = true;
+      // Deliberately NOT an exit. The runtime passes through STOPPING as a
+      // matter of course, including moments after the session starts, so
+      // quitting here killed the session after four frames. Leaving is
+      // handled by the activity's own lifecycle instead, which is the thing
+      // that actually knows the viewer has gone.
     } else if (s.state == XR_SESSION_STATE_EXITING || s.state == XR_SESSION_STATE_LOSS_PENDING) {
       s.quit = true;
     }
@@ -533,39 +542,21 @@ void SubmitFrame(Session& s) {
 // viewer back to the panel. Without this the frame loop stops while the
 // activity stays up showing nothing, and the only way out is killing the app.
 void NotifySessionEnded(JNIEnv* env) {
-  jclass cls = env->FindClass("com/edde746/plezy/xr/ImmersiveSession");
-  if (cls == nullptr) {
-    env->ExceptionClear();
-    LOGE("could not find ImmersiveSession to report the session end");
-    return;
-  }
-  jmethodID method = env->GetStaticMethodID(cls, "onSessionEndedFromNative", "()V");
-  if (method == nullptr) {
-    env->ExceptionClear();
-    LOGE("could not find onSessionEndedFromNative");
-    env->DeleteLocalRef(cls);
-    return;
-  }
-  env->CallStaticVoidMethod(cls, method);
+  Session& s = g_session;
+  if (s.sessionClass == nullptr || s.onSessionEndedMethod == nullptr) return;
+  env->CallStaticVoidMethod(s.sessionClass, s.onSessionEndedMethod);
   if (env->ExceptionCheck()) env->ExceptionClear();
-  env->DeleteLocalRef(cls);
 }
 
 void DispatchInput(JNIEnv* env, int action) {
-  jclass cls = env->FindClass("com/edde746/plezy/xr/ImmersiveSession");
-  if (cls == nullptr) {
-    env->ExceptionClear();
+  Session& s = g_session;
+  if (s.sessionClass == nullptr || s.onInputMethod == nullptr) {
+    LOGE("input %d dropped: the session class was never cached", action);
     return;
   }
-  jmethodID method = env->GetStaticMethodID(cls, "onInputFromNative", "(I)V");
-  if (method == nullptr) {
-    env->ExceptionClear();
-    env->DeleteLocalRef(cls);
-    return;
-  }
-  env->CallStaticVoidMethod(cls, method, static_cast<jint>(action));
+  LOGI("input %d", action);
+  env->CallStaticVoidMethod(s.sessionClass, s.onInputMethod, static_cast<jint>(action));
   if (env->ExceptionCheck()) env->ExceptionClear();
-  env->DeleteLocalRef(cls);
 }
 
 void RunSession(Session& s) {
@@ -637,6 +628,31 @@ extern "C" JNIEXPORT jobject JNICALL Java_com_edde746_plezy_xr_ImmersiveSession_
   }
   env->GetJavaVM(&s.vm);
   s.activity = env->NewGlobalRef(activity);
+  if (s.sessionClass == nullptr) {
+    jclass local = env->FindClass("com/edde746/plezy/xr/ImmersiveSession");
+    if (local != nullptr) {
+      s.sessionClass = static_cast<jclass>(env->NewGlobalRef(local));
+      s.onSessionEndedMethod = env->GetStaticMethodID(s.sessionClass, "onSessionEndedFromNative", "()V");
+      // A missing method leaves a NoSuchMethodError pending, and the next JNI
+      // call aborts the process rather than reporting it. Clear it and carry
+      // on without the callback: the film is still watchable.
+      if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        s.onSessionEndedMethod = nullptr;
+        LOGE("onSessionEndedFromNative missing; is it kept from R8?");
+      }
+      s.onInputMethod = env->GetStaticMethodID(s.sessionClass, "onInputFromNative", "(I)V");
+      if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        s.onInputMethod = nullptr;
+        LOGE("onInputFromNative missing; is it kept from R8?");
+      }
+      env->DeleteLocalRef(local);
+    } else {
+      env->ExceptionClear();
+      LOGE("could not cache ImmersiveSession; input and exit will not be reported");
+    }
+  }
   s.width = width;
   s.height = height;
   s.quit = false;

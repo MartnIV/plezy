@@ -45,6 +45,25 @@ object ImmersiveSession {
   @JvmStatic
   external fun nativeSetOsdVisible(visible: Boolean)
 
+  @JvmStatic
+  external fun nativeSetContentFps(fps: Float)
+
+  @JvmStatic
+  external fun nativeStarfieldSurface(): Surface?
+
+  /**
+   * Tells the session what frame rate the film runs at, so the headset can be
+   * asked for a whole multiple of it.
+   *
+   * Safe before the session exists: the value is held and applied once the
+   * frame loop is running, which is the common case -- playback usually starts
+   * on the panel and moves to the headset afterwards.
+   */
+  fun setContentFps(fps: Double) {
+    if (!loaded || fps <= 0.0) return
+    nativeSetContentFps(fps.toFloat())
+  }
+
   /**
    * Shows the control bar and starts the countdown to hiding it again.
    *
@@ -59,17 +78,20 @@ object ImmersiveSession {
   @Volatile
   private var lastStatus: ImmersivePlaybackStatus? = null
 
+  @Volatile
+  private var starfieldDrawn = false
+
   @Synchronized
-  fun showOsd(status: ImmersivePlaybackStatus, autoHide: Boolean = true) {
+  fun showOsd(status: ImmersivePlaybackStatus, autoHide: Boolean = focusedButton < 0) {
     lastStatus = status
     val surface = nativeOsdSurface()
     if (surface == null) {
       Log.w(TAG, "no OSD surface; the control bar cannot be drawn")
       return
     }
-    ImmersiveOsd.draw(surface, status)
+    ImmersiveOsd.draw(surface, status, buttons = buttonLabels(), focusedButton = focusedButton)
     nativeSetOsdVisible(true)
-    Log.i(TAG, "osd shown: ${status.positionMs}/${status.durationMs} playing=${status.isPlaying}")
+    Log.i(TAG, "osd shown: ${status.positionMs}/${status.durationMs} playing=${status.isPlaying} focus=$focusedButton")
     osdHideRunnable?.let(osdHandler::removeCallbacks)
     if (!autoHide) return
     val hide = Runnable { nativeSetOsdVisible(false) }
@@ -87,7 +109,7 @@ object ImmersiveSession {
   fun showNotice(text: String) {
     val status = lastStatus ?: ImmersivePlaybackStatus(false, 0, 0, "")
     val surface = nativeOsdSurface() ?: return
-    ImmersiveOsd.draw(surface, status, notice = text)
+    ImmersiveOsd.draw(surface, status, notice = text.ifEmpty { null }, buttons = buttonLabels(), focusedButton = focusedButton)
     nativeSetOsdVisible(true)
     osdHideRunnable?.let(osdHandler::removeCallbacks)
     val hide = Runnable { nativeSetOsdVisible(false) }
@@ -101,7 +123,7 @@ object ImmersiveSession {
   fun updateOsd(status: ImmersivePlaybackStatus) {
     lastStatus = status
     val surface = nativeOsdSurface() ?: return
-    ImmersiveOsd.draw(surface, status)
+    ImmersiveOsd.draw(surface, status, buttons = buttonLabels(), focusedButton = focusedButton)
   }
 
   @Synchronized
@@ -146,6 +168,20 @@ object ImmersiveSession {
   // the action code so the bridge needs no second callback, and therefore no
   // second R8 keep rule to be forgotten later.
   private const val INPUT_STEREO_MODE_BASE = 10
+  private const val INPUT_FOCUS_BASE = 20
+  private const val INPUT_BACKGROUND_BASE = 30
+
+  private val backgroundLabels = arrayOf("Black", "Space", "Passthrough")
+
+  /** Which button the stick is on, and what the buttons say. */
+  @Volatile
+  private var focusedButton = -1
+
+  @Volatile
+  private var backgroundMode = 0
+
+  private fun buttonLabels(): List<String> =
+    listOf("Back to panel", "Background: ${backgroundLabels.getOrElse(backgroundMode) { "?" }}")
 
   private val stereoLabels = arrayOf("2D", "3D side-by-side", "3D top/bottom")
 
@@ -153,6 +189,24 @@ object ImmersiveSession {
   fun onInputFromNative(action: Int) {
     if (action == INPUT_EXIT) {
       onSessionEnded?.invoke()
+      return
+    }
+    if (action >= INPUT_BACKGROUND_BASE) {
+      backgroundMode = action - INPUT_BACKGROUND_BASE
+      // Painted the first time it is asked for: most sessions never show it,
+      // and three thousand stars is not work to do for nobody.
+      if (backgroundMode == 1 && !starfieldDrawn) {
+        nativeStarfieldSurface()?.let {
+          ImmersiveOsd.drawStarfield(it)
+          starfieldDrawn = true
+        }
+      }
+      showNotice("Background: ${backgroundLabels.getOrElse(backgroundMode) { "?" }}")
+      return
+    }
+    if (action >= INPUT_FOCUS_BASE - 1 && action <= INPUT_FOCUS_BASE + 8) {
+      focusedButton = action - INPUT_FOCUS_BASE
+      lastStatus?.let { showOsd(it) } ?: showNotice("")
       return
     }
     if (action >= INPUT_STEREO_MODE_BASE) {

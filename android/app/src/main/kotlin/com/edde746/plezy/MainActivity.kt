@@ -940,6 +940,10 @@ class MainActivity : FlutterActivity() {
             ImmersiveSession.hideOsd()
             result.success(null)
           }
+          "setContentFps" -> {
+            ImmersiveSession.setContentFps((call.argument<Number>("fps") ?: 0).toDouble())
+            result.success(null)
+          }
           else -> result.notImplemented()
         }
       }

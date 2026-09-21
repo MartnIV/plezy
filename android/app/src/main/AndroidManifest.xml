@@ -35,6 +35,11 @@
          cars, so this must never be required or those stores stop listing it. -->
     <uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="false" />
 
+    <!-- Horizon OS only exposes XR_FB_passthrough to apps that declare this,
+         which is why the capability probe reported it missing. Never required:
+         the same APK ships to phones, TVs and cars. -->
+    <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
+
     <application
         android:label="Plezy"
         android:name="${applicationName}"

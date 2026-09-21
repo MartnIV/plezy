@@ -23,6 +23,17 @@ extension _VideoPlayerDisplayMatchingMethods on VideoPlayerScreenState {
   /// actually switched — seeking to [refreshPosition] when given (where the
   /// measurement window started), else in place. The caller has already
   /// paused playback. Returns whether a switch was initiated.
+  void _pushImmersiveContentFps(double? fps) {
+    if (!PlatformDetector.isVR() || fps == null || fps <= 0) return;
+    unawaited(
+      immersiveControlChannel.invokeMethod<void>('setContentFps', <String, dynamic>{'fps': fps}).catchError((
+        Object error,
+      ) {
+        appLogger.d('Immersive fps push failed: $error');
+      }),
+    );
+  }
+
   Future<bool> _switchDisplayToTarget({
     required Player currentPlayer,
     required SettingsService settingsService,
@@ -31,6 +42,11 @@ extension _VideoPlayerDisplayMatchingMethods on VideoPlayerScreenState {
     Duration? refreshPosition,
   }) async {
     _frameRate.applied = true;
+    // The headset wants the same number for a different purpose: a whole
+    // multiple of the film's rate, rather than an HDMI mode. Sent whether or
+    // not playback is on the big screen yet, because it usually is not -- the
+    // session holds it until there is one.
+    _pushImmersiveContentFps(target.fps);
     final durationMs = currentPlayer.state.duration.inMilliseconds;
     final didSwitch = await _switchDisplayFrameRateForOpen(
       player: currentPlayer,

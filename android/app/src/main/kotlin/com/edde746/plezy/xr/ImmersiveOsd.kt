@@ -58,7 +58,67 @@ object ImmersiveOsd {
    * has no other visible effect -- the 3D layout above all, which otherwise
    * has to be cycled blind and judged by whether the picture looks wrong.
    */
-  fun draw(target: Surface, status: ImmersivePlaybackStatus, notice: String? = null) {
+  /**
+   * Paints a starfield for the equirect background layer.
+   *
+   * Drawn once, not animated: a cinema needs a quiet backdrop, and anything
+   * that moves in the corner of the eye competes with the film. Stars thin out
+   * toward the poles because the equirect projection stretches those rows
+   * enormously, and an even scatter here would clump into two bright caps
+   * overhead and underfoot.
+   */
+  fun drawStarfield(target: Surface) {
+    val canvas: Canvas = try {
+      target.lockCanvas(null)
+    } catch (error: Throwable) {
+      Log.w(TAG, "could not lock the starfield surface", error)
+      return
+    }
+    try {
+      val w = canvas.width
+      val h = canvas.height
+      canvas.drawColor(Color.rgb(3, 4, 10))
+
+      // Fixed seed: the sky should be the same every time rather than
+      // rearranging itself between films.
+      val random = java.util.Random(0x51A25)
+      val paint = Paint().apply { isAntiAlias = true }
+      repeat(3000) {
+        val x = random.nextFloat() * w
+        val v = random.nextFloat()
+        val y = v * h
+        // Density falls off with the projection's vertical stretch.
+        val latitude = (v - 0.5) * Math.PI
+        if (random.nextFloat() > Math.cos(latitude)) return@repeat
+
+        val brightness = random.nextFloat()
+        val alpha = (60 + brightness * 195).toInt().coerceIn(0, 255)
+        // A few stars lean warm or cool; a uniformly white sky looks printed.
+        val tint = random.nextFloat()
+        paint.color = when {
+          tint > 0.93f -> Color.argb(alpha, 255, 220, 190)
+          tint < 0.07f -> Color.argb(alpha, 200, 220, 255)
+          else -> Color.argb(alpha, 255, 255, 255)
+        }
+        canvas.drawCircle(x, y, 0.6f + brightness * 1.4f, paint)
+      }
+    } finally {
+      try {
+        target.unlockCanvasAndPost(canvas)
+      } catch (error: Throwable) {
+        Log.w(TAG, "could not post the starfield", error)
+      }
+    }
+    Log.i(TAG, "starfield drawn")
+  }
+
+  fun draw(
+    target: Surface,
+    status: ImmersivePlaybackStatus,
+    notice: String? = null,
+    buttons: List<String> = emptyList(),
+    focusedButton: Int = -1,
+  ) {
     val canvas: Canvas = try {
       target.lockCanvas(null)
     } catch (error: Throwable) {
@@ -112,6 +172,8 @@ object ImmersiveOsd {
       val clock = "${formatTime(status.positionMs)} / ${formatTime(status.durationMs)}"
       canvas.drawText(clock, w - padding, h * 0.36f, textPaint)
 
+      if (buttons.isNotEmpty()) drawButtons(canvas, buttons, focusedButton, w, h, padding)
+
       val barTop = h * 0.60f
       val barHeight = h * 0.10f
       val barLeft = padding
@@ -137,6 +199,50 @@ object ImmersiveOsd {
         Log.w(TAG, "could not post the OSD frame", error)
       }
     }
+  }
+
+  /**
+   * The button row, laid out from the right.
+   *
+   * Only the focused button is drawn filled. Nothing here is pointed at, so
+   * there is no hover state to show and no reason to make the others compete
+   * with the film for attention.
+   */
+  private fun drawButtons(
+    canvas: Canvas,
+    buttons: List<String>,
+    focused: Int,
+    w: Float,
+    h: Float,
+    padding: Float,
+  ) {
+    val buttonHeight = h * 0.26f
+    val top = h * 0.74f - buttonHeight / 2f
+    val textSize = h * 0.15f
+    textPaint.textSize = textSize
+    textPaint.textAlign = Paint.Align.CENTER
+
+    var right = w - padding
+    for (index in buttons.indices.reversed()) {
+      val label = buttons[index]
+      val width = textPaint.measureText(label) + h * 0.30f
+      val left = right - width
+      val rect = RectF(left, top, right, top + buttonHeight)
+      val radius = buttonHeight / 2f
+
+      if (index == focused) {
+        progressPaint.color = Color.rgb(120, 170, 255)
+        canvas.drawRoundRect(rect, radius, radius, progressPaint)
+        textPaint.color = Color.rgb(8, 12, 20)
+      } else {
+        canvas.drawRoundRect(rect, radius, radius, trackPaint)
+        textPaint.color = Color.argb(220, 235, 235, 240)
+      }
+      canvas.drawText(label, (left + right) / 2f, top + buttonHeight * 0.70f, textPaint)
+      right = left - padding * 0.5f
+    }
+    textPaint.color = Color.WHITE
+    textPaint.textAlign = Paint.Align.LEFT
   }
 
   private fun ellipsize(text: String, paint: Paint, maxWidth: Float): String {

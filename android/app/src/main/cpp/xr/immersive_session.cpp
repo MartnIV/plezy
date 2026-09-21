@@ -63,6 +63,20 @@ constexpr int kOsdPixelHeight = 192;
 // viewer cycles it and sees the result immediately.
 enum class StereoMode { Mono = 0, SideBySide = 1, TopBottom = 2 };
 
+// What sits behind the screen.
+enum class Background { Black = 0, Space = 1, Passthrough = 2 };
+
+// The starfield's equirect texture. Wide and short because it wraps the whole
+// horizon but most of it is empty sky; stars are points, so resolution buys
+// little beyond this.
+constexpr int kStarfieldWidth = 2048;
+constexpr int kStarfieldHeight = 1024;
+
+// The control bar's buttons, navigated with the stick rather than pointed at.
+constexpr int kButtonCount = 2;
+constexpr int kButtonBackToPanel = 0;
+constexpr int kButtonBackground = 1;
+
 struct Session {
   JavaVM* vm = nullptr;
   jobject activity = nullptr;  // global ref
@@ -95,6 +109,22 @@ struct Session {
   XrAction recenterAction = XR_NULL_HANDLE;
   XrAction stereoAction = XR_NULL_HANDLE;
   std::atomic<int> stereoMode{static_cast<int>(StereoMode::Mono)};
+  // The film's frame rate, pushed from Dart. Applied once the session exists;
+  // playback usually starts before the viewer moves it to the big screen.
+  std::atomic<float> contentFps{0.0f};
+  std::atomic<bool> refreshRatePending{false};
+
+  std::atomic<int> background{static_cast<int>(Background::Black)};
+  XrSwapchain starfieldSwapchain = XR_NULL_HANDLE;
+  jobject starfieldSurface = nullptr;  // global ref
+  XrPassthroughFB passthrough = XR_NULL_HANDLE;
+  XrPassthroughLayerFB passthroughLayer = XR_NULL_HANDLE;
+  bool passthroughStarted = false;
+
+  // -1 when the viewer is watching rather than navigating. The stick doubles
+  // as seek and as a d-pad, and this is which of the two it currently means.
+  std::atomic<int> uiFocus{-1};
+  int lastSeekVertical = 0;
   bool actionsAttached = false;
   // Rising-edge latch for the stick, so holding it does not spray seeks.
   int lastSeekDirection = 0;
@@ -195,6 +225,10 @@ bool CreateInstanceAndSystem(Session& s) {
       "XR_FB_composition_layer_image_layout",
       // Compositor-side sharpening for the picture layer.
       "XR_FB_composition_layer_settings",
+      // Lets the headset run at a multiple of the film's frame rate.
+      "XR_FB_display_refresh_rate",
+      // The room behind the screen, when the viewer wants it.
+      "XR_FB_passthrough",
   };
 
   XrInstanceCreateInfoAndroidKHR androidInfo{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
@@ -331,6 +365,10 @@ constexpr int kInputExit = 4;
 // 3D layout, reported as a base plus the mode so it needs no second callback
 // (and therefore no second R8 keep rule).
 constexpr int kInputStereoModeBase = 10;
+// Which button is focused (base + index), or base - 1 for none.
+constexpr int kInputFocusBase = 20;
+// Which background is showing (base + mode).
+constexpr int kInputBackgroundBase = 30;
 
 
 XrPath ToPath(XrInstance instance, const char* text) {
@@ -406,6 +444,56 @@ bool CreateInput(Session& s) {
   return true;
 }
 
+// Runs the headset at a whole multiple of the film's frame rate.
+//
+// 24fps on a 72Hz display shows every frame for exactly three refreshes; on
+// 90Hz it alternates three and four, and that unevenness is the judder that
+// makes panning shots look wrong. It is far more obvious in a headset than on
+// a television, because the screen is fixed in the world and the eye tracks
+// across it.
+void ApplyRefreshRateForContent(Session& s) {
+  const float fps = s.contentFps.load();
+  if (fps <= 0.0f) return;
+
+  PFN_xrEnumerateDisplayRefreshRatesFB enumerateRates = nullptr;
+  PFN_xrRequestDisplayRefreshRateFB requestRate = nullptr;
+  if (XR_FAILED(xrGetInstanceProcAddr(s.instance, "xrEnumerateDisplayRefreshRatesFB",
+                                      reinterpret_cast<PFN_xrVoidFunction*>(&enumerateRates))) ||
+      XR_FAILED(xrGetInstanceProcAddr(s.instance, "xrRequestDisplayRefreshRateFB",
+                                      reinterpret_cast<PFN_xrVoidFunction*>(&requestRate))) ||
+      enumerateRates == nullptr || requestRate == nullptr) {
+    return;
+  }
+
+  uint32_t count = 0;
+  if (XR_FAILED(enumerateRates(s.session, 0, &count, nullptr)) || count == 0) return;
+  std::vector<float> rates(count, 0.0f);
+  if (XR_FAILED(enumerateRates(s.session, count, &count, rates.data()))) return;
+
+  // Pick the rate closest to a whole multiple of the content, and among
+  // equally good candidates the highest -- a higher refresh is smoother for
+  // everything that is not the film, the control bar and head motion included.
+  float best = 0.0f;
+  float bestError = 1e9f;
+  for (const float rate : rates) {
+    if (rate <= 0.0f) continue;
+    const float multiple = rate / fps;
+    const float error = std::fabs(multiple - std::round(multiple));
+    if (error < bestError - 1e-4f || (std::fabs(error - bestError) <= 1e-4f && rate > best)) {
+      best = rate;
+      bestError = error;
+    }
+  }
+  if (best <= 0.0f) return;
+
+  const XrResult result = requestRate(s.session, best);
+  if (XR_SUCCEEDED(result)) {
+    LOGI("display refresh %.2f Hz for %.3f fps content (error %.4f)", best, fps, bestError);
+  } else {
+    LOGE("xrRequestDisplayRefreshRateFB(%.2f) failed: %d", best, result);
+  }
+}
+
 bool CreateSurfaceSwapchain(Session& s, JNIEnv* env) {
   PFN_xrCreateSwapchainAndroidSurfaceKHR createSurfaceSwapchain = nullptr;
   if (XR_FAILED(xrGetInstanceProcAddr(s.instance, "xrCreateSwapchainAndroidSurfaceKHR",
@@ -463,6 +551,75 @@ bool CreateSurfaceSwapchain(Session& s, JNIEnv* env) {
   }
   s.osdSurface = env->NewGlobalRef(localOsdSurface);
   LOGI("osd swapchain ready %dx%d", kOsdPixelWidth, kOsdPixelHeight);
+
+  XrSwapchainCreateInfo starInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+  starInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+  starInfo.width = kStarfieldWidth;
+  starInfo.height = kStarfieldHeight;
+  starInfo.format = 0;
+  starInfo.faceCount = 0;
+  starInfo.arraySize = 0;
+  starInfo.mipCount = 0;
+  starInfo.sampleCount = 0;
+
+  jobject localStarSurface = nullptr;
+  const XrResult starResult = createSurfaceSwapchain(s.session, &starInfo, &s.starfieldSwapchain, &localStarSurface);
+  if (XR_FAILED(starResult) || localStarSurface == nullptr) {
+    LOGE("could not create the starfield swapchain: %d", starResult);
+    s.starfieldSwapchain = XR_NULL_HANDLE;
+    return true;
+  }
+  s.starfieldSurface = env->NewGlobalRef(localStarSurface);
+  LOGI("starfield swapchain ready %dx%d", kStarfieldWidth, kStarfieldHeight);
+  return true;
+}
+
+// Brings up passthrough the first time the viewer asks for it.
+//
+// Created lazily because most sessions never use it, and a running passthrough
+// costs cameras and power even when nothing composites it.
+bool EnsurePassthrough(Session& s) {
+  if (s.passthroughStarted) return true;
+
+  PFN_xrCreatePassthroughFB createPassthrough = nullptr;
+  PFN_xrPassthroughStartFB startPassthrough = nullptr;
+  PFN_xrCreatePassthroughLayerFB createLayer = nullptr;
+  if (XR_FAILED(xrGetInstanceProcAddr(s.instance, "xrCreatePassthroughFB",
+                                      reinterpret_cast<PFN_xrVoidFunction*>(&createPassthrough))) ||
+      XR_FAILED(xrGetInstanceProcAddr(s.instance, "xrPassthroughStartFB",
+                                      reinterpret_cast<PFN_xrVoidFunction*>(&startPassthrough))) ||
+      XR_FAILED(xrGetInstanceProcAddr(s.instance, "xrCreatePassthroughLayerFB",
+                                      reinterpret_cast<PFN_xrVoidFunction*>(&createLayer)))) {
+    LOGE("passthrough entry points unavailable");
+    return false;
+  }
+
+  if (s.passthrough == XR_NULL_HANDLE) {
+    XrPassthroughCreateInfoFB info{XR_TYPE_PASSTHROUGH_CREATE_INFO_FB};
+    const XrResult created = createPassthrough(s.session, &info, &s.passthrough);
+    if (XR_FAILED(created)) {
+      LOGE("xrCreatePassthroughFB failed: %d", created);
+      return false;
+    }
+  }
+  if (s.passthroughLayer == XR_NULL_HANDLE) {
+    XrPassthroughLayerCreateInfoFB info{XR_TYPE_PASSTHROUGH_LAYER_CREATE_INFO_FB};
+    info.passthrough = s.passthrough;
+    info.purpose = XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB;
+    info.flags = XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB;
+    const XrResult created = createLayer(s.session, &info, &s.passthroughLayer);
+    if (XR_FAILED(created)) {
+      LOGE("xrCreatePassthroughLayerFB failed: %d", created);
+      return false;
+    }
+  }
+  const XrResult started = startPassthrough(s.passthrough);
+  if (XR_FAILED(started)) {
+    LOGE("xrPassthroughStartFB failed: %d", started);
+    return false;
+  }
+  s.passthroughStarted = true;
+  LOGI("passthrough started");
   return true;
 }
 
@@ -536,7 +693,25 @@ void PollInput(Session& s, JNIEnv* env) {
     return state.isActive == XR_TRUE && state.currentState == XR_TRUE && state.changedSinceLastSync == XR_TRUE;
   };
 
-  if (pressed(s.playPauseAction)) DispatchInput(env, kInputPlayPause);
+  if (pressed(s.playPauseAction)) {
+    const int focus = s.uiFocus.load();
+    if (focus == kButtonBackToPanel) {
+      DispatchInput(env, kInputExit);
+    } else if (focus == kButtonBackground) {
+      const int next = (s.background.load() + 1) % 3;
+      // Passthrough has to be running before it can be composited; falling
+      // back to black is better than a frame of nothing.
+      if (static_cast<Background>(next) == Background::Passthrough && !EnsurePassthrough(s)) {
+        s.background.store(static_cast<int>(Background::Black));
+        DispatchInput(env, kInputBackgroundBase + static_cast<int>(Background::Black));
+      } else {
+        s.background.store(next);
+        DispatchInput(env, kInputBackgroundBase + next);
+      }
+    } else {
+      DispatchInput(env, kInputPlayPause);
+    }
+  }
   if (pressed(s.exitAction)) DispatchInput(env, kInputExit);
   // Handled here rather than through Dart: it moves the screen, which is this
   // side's business entirely and should not wait on a round trip.
@@ -553,14 +728,39 @@ void PollInput(Session& s, JNIEnv* env) {
   XrActionStateVector2f seek{XR_TYPE_ACTION_STATE_VECTOR2F};
   if (XR_SUCCEEDED(xrGetActionStateVector2f(s.session, &seekInfo, &seek)) && seek.isActive == XR_TRUE) {
     // Generous deadzone: a thumb resting on the stick should not scrub the
-    // film, and the edge latch means one push is one seek however long it
+    // film, and the edge latch means one push is one move however long it
     // is held.
     constexpr float kDeadzone = 0.6f;
-    const int direction = seek.currentState.x > kDeadzone ? 1 : (seek.currentState.x < -kDeadzone ? -1 : 0);
-    if (direction != s.lastSeekDirection) {
-      if (direction > 0) DispatchInput(env, kInputSeekForward);
-      if (direction < 0) DispatchInput(env, kInputSeekBackward);
-      s.lastSeekDirection = direction;
+    const int horizontal = seek.currentState.x > kDeadzone ? 1 : (seek.currentState.x < -kDeadzone ? -1 : 0);
+    const int vertical = seek.currentState.y > kDeadzone ? 1 : (seek.currentState.y < -kDeadzone ? -1 : 0);
+
+    // Up reaches the buttons, down goes back to watching. The stick means
+    // "seek" or "move between buttons" depending on which of those two the
+    // viewer is currently doing, the way a remote's d-pad does.
+    if (vertical != s.lastSeekVertical) {
+      if (vertical > 0 && s.uiFocus.load() < 0) {
+        s.uiFocus.store(0);
+        DispatchInput(env, kInputFocusBase + 0);
+      } else if (vertical < 0 && s.uiFocus.load() >= 0) {
+        s.uiFocus.store(-1);
+        DispatchInput(env, kInputFocusBase - 1);
+      }
+      s.lastSeekVertical = vertical;
+    }
+
+    if (horizontal != s.lastSeekDirection) {
+      const int focus = s.uiFocus.load();
+      if (focus >= 0) {
+        if (horizontal != 0) {
+          const int next = (focus + (horizontal > 0 ? 1 : kButtonCount - 1)) % kButtonCount;
+          s.uiFocus.store(next);
+          DispatchInput(env, kInputFocusBase + next);
+        }
+      } else {
+        if (horizontal > 0) DispatchInput(env, kInputSeekForward);
+        if (horizontal < 0) DispatchInput(env, kInputSeekBackward);
+      }
+      s.lastSeekDirection = horizontal;
     }
   }
 }
@@ -581,6 +781,7 @@ void SubmitFrame(Session& s) {
   if (s.recenterRequested.load() && RecenterScreen(s, frameState.predictedDisplayTime)) {
     s.recenterRequested.store(false);
   }
+  if (s.refreshRatePending.exchange(false)) ApplyRefreshRateForContent(s);
 
   // An Android Surface producer -- Canvas, MediaCodec, anything -- writes with
   // the origin at the top left, while the compositor samples from the bottom
@@ -662,9 +863,42 @@ void SubmitFrame(Session& s) {
 
   const bool showOsd = s.osdSwapchain != XR_NULL_HANDLE && s.osdVisible.load();
   const bool isStereo = stereo != StereoMode::Mono;
+  const Background background = static_cast<Background>(s.background.load());
 
-  const XrCompositionLayerBaseHeader* layers[3];
+  // The room, composited under everything else. Layer order is what puts it
+  // behind the screen rather than over it.
+  XrCompositionLayerPassthroughFB passthroughLayer{XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB};
+  passthroughLayer.layerHandle = s.passthroughLayer;
+  passthroughLayer.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+  passthroughLayer.space = XR_NULL_HANDLE;
+
+  // The starfield, wrapped right around the viewer. Radius 0 means infinitely
+  // far, so it never moves as they lean and reads as sky rather than wallpaper.
+  XrCompositionLayerImageLayoutFB starLayout{XR_TYPE_COMPOSITION_LAYER_IMAGE_LAYOUT_FB};
+  starLayout.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
+
+  XrCompositionLayerEquirect2KHR starfield{XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR};
+  starfield.next = &starLayout;
+  starfield.layerFlags = 0;
+  starfield.space = s.space;
+  starfield.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+  starfield.subImage.swapchain = s.starfieldSwapchain;
+  starfield.subImage.imageRect.offset = {0, 0};
+  starfield.subImage.imageRect.extent = {kStarfieldWidth, kStarfieldHeight};
+  starfield.subImage.imageArrayIndex = 0;
+  starfield.pose.orientation.w = 1.0f;
+  starfield.radius = 0.0f;
+  starfield.centralHorizontalAngle = 6.2831853f;
+  starfield.upperVerticalAngle = 1.5707963f;
+  starfield.lowerVerticalAngle = -1.5707963f;
+
+  const bool showPassthrough = background == Background::Passthrough && s.passthroughLayer != XR_NULL_HANDLE;
+  const bool showStarfield = background == Background::Space && s.starfieldSwapchain != XR_NULL_HANDLE;
+
+  const XrCompositionLayerBaseHeader* layers[5];
   uint32_t layerCount = 0;
+  if (showPassthrough) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&passthroughLayer);
+  if (showStarfield) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&starfield);
   layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&cylinder);
   if (isStereo) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&cylinderRight);
   if (showOsd) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&osd);
@@ -712,7 +946,12 @@ void RunSession(Session& s) {
                      CreateSession(s) && CreateSurfaceSwapchain(s, env);
   // Input is not fatal: a viewer can still watch without the controllers, so a
   // failure here logs and leaves the screen running.
-  if (ready) CreateInput(s);
+  if (ready) {
+    CreateInput(s);
+    // Dart usually knows the frame rate before the viewer moves playback to
+    // the big screen, so honour whatever arrived first.
+    if (s.contentFps.load() > 0.0f) s.refreshRatePending.store(true);
+  }
   // Unblocks the caller whether or not setup worked; a null surface is how it
   // learns that it failed.
   PublishSurface(s);
@@ -735,6 +974,8 @@ void RunSession(Session& s) {
   }
 
   if (s.running) xrEndSession(s.session);
+  if (s.starfieldSwapchain != XR_NULL_HANDLE) xrDestroySwapchain(s.starfieldSwapchain);
+  s.starfieldSwapchain = XR_NULL_HANDLE;
   if (s.actionSet != XR_NULL_HANDLE) xrDestroyActionSet(s.actionSet);
   if (s.osdSwapchain != XR_NULL_HANDLE) xrDestroySwapchain(s.osdSwapchain);
   if (s.swapchain != XR_NULL_HANDLE) xrDestroySwapchain(s.swapchain);
@@ -746,6 +987,8 @@ void RunSession(Session& s) {
   if (s.session != XR_NULL_HANDLE) xrDestroySession(s.session);
   if (s.instance != XR_NULL_HANDLE) xrDestroyInstance(s.instance);
   DestroyEgl(s);
+  if (s.starfieldSurface != nullptr) env->DeleteGlobalRef(s.starfieldSurface);
+  s.starfieldSurface = nullptr;
   if (s.osdSurface != nullptr) env->DeleteGlobalRef(s.osdSurface);
   if (s.surface != nullptr) env->DeleteGlobalRef(s.surface);
   if (s.activity != nullptr) env->DeleteGlobalRef(s.activity);
@@ -813,6 +1056,19 @@ extern "C" JNIEXPORT jobject JNICALL Java_com_edde746_plezy_xr_ImmersiveSession_
 extern "C" JNIEXPORT jobject JNICALL
 Java_com_edde746_plezy_xr_ImmersiveSession_nativeOsdSurface(JNIEnv*, jclass) {
   return g_session.osdSurface;
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_edde746_plezy_xr_ImmersiveSession_nativeStarfieldSurface(JNIEnv*, jclass) {
+  return g_session.starfieldSurface;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_edde746_plezy_xr_ImmersiveSession_nativeSetContentFps(JNIEnv*, jclass, jfloat fps) {
+  g_session.contentFps.store(static_cast<float>(fps));
+  // Applied on the session thread: the refresh request belongs with the frame
+  // loop, and this may arrive before the session exists at all.
+  g_session.refreshRatePending.store(true);
 }
 
 extern "C" JNIEXPORT void JNICALL

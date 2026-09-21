@@ -65,7 +65,15 @@ struct Session {
   XrInstance instance = XR_NULL_HANDLE;
   XrSystemId systemId = XR_NULL_SYSTEM_ID;
   XrSession session = XR_NULL_HANDLE;
+  // The space the screen lives in. Re-created on every recentre so it sits
+  // where the viewer is looking, rather than wherever the headset happened to
+  // be when the session started -- which is a desk as often as a face.
   XrSpace space = XR_NULL_HANDLE;
+  // Reads the head pose. VIEW is head-locked by definition, so locating it
+  // against LOCAL gives where the viewer is and which way they face.
+  XrSpace viewSpace = XR_NULL_HANDLE;
+  XrSpace localSpace = XR_NULL_HANDLE;
+  std::atomic<bool> recenterRequested{true};  // the first frame places the screen
   XrSwapchain swapchain = XR_NULL_HANDLE;
   XrSwapchain osdSwapchain = XR_NULL_HANDLE;
   jobject osdSurface = nullptr;  // global ref
@@ -79,6 +87,7 @@ struct Session {
   XrAction playPauseAction = XR_NULL_HANDLE;
   XrAction exitAction = XR_NULL_HANDLE;
   XrAction seekAction = XR_NULL_HANDLE;
+  XrAction recenterAction = XR_NULL_HANDLE;
   bool actionsAttached = false;
   // Rising-edge latch for the stick, so holding it does not spray seeks.
   int lastSeekDirection = 0;
@@ -177,6 +186,8 @@ bool CreateInstanceAndSystem(Session& s) {
       // Corrects the origin mismatch between Surface producers and the
       // compositor; see the layout chained onto the layer in SubmitFrame.
       "XR_FB_composition_layer_image_layout",
+      // Compositor-side sharpening for the picture layer.
+      "XR_FB_composition_layer_settings",
   };
 
   XrInstanceCreateInfoAndroidKHR androidInfo{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
@@ -241,11 +252,67 @@ bool CreateSession(Session& s) {
   XrReferenceSpaceCreateInfo spaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
   spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
   spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
-  result = xrCreateReferenceSpace(s.session, &spaceInfo, &s.space);
+  result = xrCreateReferenceSpace(s.session, &spaceInfo, &s.localSpace);
   if (XR_FAILED(result)) {
-    LOGE("xrCreateReferenceSpace failed: %d", result);
+    LOGE("xrCreateReferenceSpace(LOCAL) failed: %d", result);
     return false;
   }
+  // Until the first recentre lands, the screen hangs off the raw LOCAL origin.
+  result = xrCreateReferenceSpace(s.session, &spaceInfo, &s.space);
+  if (XR_FAILED(result)) {
+    LOGE("xrCreateReferenceSpace(content) failed: %d", result);
+    return false;
+  }
+
+  XrReferenceSpaceCreateInfo viewInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+  viewInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+  viewInfo.poseInReferenceSpace.orientation.w = 1.0f;
+  result = xrCreateReferenceSpace(s.session, &viewInfo, &s.viewSpace);
+  if (XR_FAILED(result)) {
+    // Not fatal: without it the screen simply cannot be recentred.
+    LOGE("xrCreateReferenceSpace(VIEW) failed: %d", result);
+    s.viewSpace = XR_NULL_HANDLE;
+  }
+  return true;
+}
+
+// Moves the screen in front of the viewer, facing them.
+//
+// Only the yaw of the head pose is kept. Carrying pitch and roll across would
+// tilt the screen to whatever angle the viewer's head happened to be at, which
+// is unpleasant to watch and worse to correct; a cinema screen should always
+// stand upright.
+// Returns false when the head pose is not yet known, so the caller can keep
+// asking. Tracking is routinely unavailable for the first frames -- the headset
+// is being picked up, or is still on a desk -- and giving up after one attempt
+// leaves the screen pinned to the raw origin for the whole film.
+bool RecenterScreen(Session& s, XrTime time) {
+  if (s.viewSpace == XR_NULL_HANDLE || s.localSpace == XR_NULL_HANDLE) return false;
+
+  XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+  if (XR_FAILED(xrLocateSpace(s.viewSpace, s.localSpace, time, &location))) return false;
+  const bool usable = (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
+                      (location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT);
+  if (!usable) return false;
+
+  const XrQuaternionf& q = location.pose.orientation;
+  const float yaw = std::atan2(2.0f * (q.w * q.y + q.x * q.z), 1.0f - 2.0f * (q.y * q.y + q.z * q.z));
+
+  XrReferenceSpaceCreateInfo info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+  info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+  info.poseInReferenceSpace.position = location.pose.position;
+  info.poseInReferenceSpace.orientation.x = 0.0f;
+  info.poseInReferenceSpace.orientation.y = std::sin(yaw * 0.5f);
+  info.poseInReferenceSpace.orientation.z = 0.0f;
+  info.poseInReferenceSpace.orientation.w = std::cos(yaw * 0.5f);
+
+  XrSpace recentred = XR_NULL_HANDLE;
+  if (XR_FAILED(xrCreateReferenceSpace(s.session, &info, &recentred))) return false;
+
+  XrSpace previous = s.space;
+  s.space = recentred;
+  if (previous != XR_NULL_HANDLE) xrDestroySpace(previous);
+  LOGI("screen recentred");
   return true;
 }
 
@@ -280,6 +347,7 @@ bool CreateInput(Session& s) {
 
   if (!createAction("play_pause", "Play or pause", XR_ACTION_TYPE_BOOLEAN_INPUT, &s.playPauseAction) ||
       !createAction("exit_immersive", "Leave the big screen", XR_ACTION_TYPE_BOOLEAN_INPUT, &s.exitAction) ||
+      !createAction("recenter", "Bring the screen in front of me", XR_ACTION_TYPE_BOOLEAN_INPUT, &s.recenterAction) ||
       !createAction("seek", "Seek", XR_ACTION_TYPE_VECTOR2F_INPUT, &s.seekAction)) {
     LOGE("could not create the player actions");
     return false;
@@ -294,6 +362,10 @@ bool CreateInput(Session& s) {
       {s.exitAction, ToPath(s.instance, "/user/hand/left/input/y/click")},
       {s.seekAction, ToPath(s.instance, "/user/hand/right/input/thumbstick")},
       {s.seekAction, ToPath(s.instance, "/user/hand/left/input/thumbstick")},
+      // Clicking the stick, which is otherwise unused here and hard to hit by
+      // accident while nudging it to skip.
+      {s.recenterAction, ToPath(s.instance, "/user/hand/right/input/thumbstick/click")},
+      {s.recenterAction, ToPath(s.instance, "/user/hand/left/input/thumbstick/click")},
   };
 
   XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
@@ -451,6 +523,9 @@ void PollInput(Session& s, JNIEnv* env) {
 
   if (pressed(s.playPauseAction)) DispatchInput(env, kInputPlayPause);
   if (pressed(s.exitAction)) DispatchInput(env, kInputExit);
+  // Handled here rather than through Dart: it moves the screen, which is this
+  // side's business entirely and should not wait on a round trip.
+  if (pressed(s.recenterAction)) s.recenterRequested.store(true);
 
   XrActionStateGetInfo seekInfo{XR_TYPE_ACTION_STATE_GET_INFO};
   seekInfo.action = s.seekAction;
@@ -477,6 +552,15 @@ void SubmitFrame(Session& s) {
   XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
   if (XR_FAILED(xrBeginFrame(s.session, &beginInfo))) return;
 
+  // Done here because it needs a predicted display time, and the first one
+  // places the screen where the viewer is actually looking when playback
+  // starts rather than at the raw LOCAL origin.
+  // The request is only consumed once it has actually been honoured; until
+  // then it rides along to the next frame.
+  if (s.recenterRequested.load() && RecenterScreen(s, frameState.predictedDisplayTime)) {
+    s.recenterRequested.store(false);
+  }
+
   // An Android Surface producer -- Canvas, MediaCodec, anything -- writes with
   // the origin at the top left, while the compositor samples from the bottom
   // left. Without this the picture arrives flipped top to bottom, which reads
@@ -484,8 +568,16 @@ void SubmitFrame(Session& s) {
   XrCompositionLayerImageLayoutFB imageLayout{XR_TYPE_COMPOSITION_LAYER_IMAGE_LAYOUT_FB};
   imageLayout.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
 
+  // Sharpening costs nothing here and helps: the picture is sampled onto a
+  // curved surface some way off, which softens it, and video is exactly the
+  // content this is meant for. Chained ahead of the layout so both reach the
+  // layer.
+  XrCompositionLayerSettingsFB layerSettings{XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB};
+  layerSettings.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SHARPENING_BIT_FB;
+  layerSettings.next = &imageLayout;
+
   XrCompositionLayerCylinderKHR cylinder{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
-  cylinder.next = &imageLayout;
+  cylinder.next = &layerSettings;
   cylinder.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
   cylinder.space = s.space;
   cylinder.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -597,7 +689,11 @@ void RunSession(Session& s) {
   if (s.actionSet != XR_NULL_HANDLE) xrDestroyActionSet(s.actionSet);
   if (s.osdSwapchain != XR_NULL_HANDLE) xrDestroySwapchain(s.osdSwapchain);
   if (s.swapchain != XR_NULL_HANDLE) xrDestroySwapchain(s.swapchain);
+  if (s.viewSpace != XR_NULL_HANDLE) xrDestroySpace(s.viewSpace);
+  if (s.localSpace != XR_NULL_HANDLE) xrDestroySpace(s.localSpace);
   if (s.space != XR_NULL_HANDLE) xrDestroySpace(s.space);
+  s.viewSpace = XR_NULL_HANDLE;
+  s.localSpace = XR_NULL_HANDLE;
   if (s.session != XR_NULL_HANDLE) xrDestroySession(s.session);
   if (s.instance != XR_NULL_HANDLE) xrDestroyInstance(s.instance);
   DestroyEgl(s);

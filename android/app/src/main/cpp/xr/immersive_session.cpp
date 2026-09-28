@@ -163,13 +163,17 @@ constexpr int kStarfieldHeight = 3000;
 // presses the one that is lit -- nothing acts directly any more, so there is
 // no hidden second way to do things and no unfocused state in which the bar
 // shows no highlight at all.
-constexpr int kButtonCount = 6;
+constexpr int kButtonCount = 7;
 constexpr int kButtonSeekBack = 0;
 constexpr int kButtonPlayPause = 1;
 constexpr int kButtonSeekForward = 2;
 constexpr int kButtonScreen = 3;
-constexpr int kButtonBackToPanel = 4;
+constexpr int kButtonTilt = 4;
 constexpr int kButtonBackground = 5;
+// Last, and drawn with a gap before it. Leaving is the one control here that
+// ends what the viewer is doing, and it should not sit shoulder to shoulder
+// with the ones that merely adjust it.
+constexpr int kButtonBackToPanel = 6;
 // Play/pause is where focus starts: the middle of the transport group, one
 // step from the seek controls either side.
 constexpr int kInitialFocus = kButtonPlayPause;
@@ -233,6 +237,11 @@ struct Session {
 
   std::atomic<int> background{static_cast<int>(Background::Black)};
   std::atomic<int> screenPreset{kDefaultScreenPreset};
+  // Whether a recentre may tilt the screen to match where the viewer is
+  // actually looking. Off by default: seated, an upright screen is right and a
+  // tilted one is a mistake. On, it puts the picture overhead for someone
+  // lying down, which no amount of yaw can do.
+  std::atomic<bool> tiltFree{false};
   XrSwapchain starfieldSwapchain = XR_NULL_HANDLE;
   jobject starfieldSurface = nullptr;  // global ref
   XrPassthroughFB passthrough = XR_NULL_HANDLE;
@@ -462,15 +471,34 @@ bool RecenterScreen(Session& s, XrTime time) {
   if (!usable) return false;
 
   const XrQuaternionf& q = location.pose.orientation;
-  const float yaw = std::atan2(2.0f * (q.w * q.y + q.x * q.z), 1.0f - 2.0f * (q.y * q.y + q.z * q.z));
+
+  // Where the head is pointing, as a direction rather than a rotation: taking
+  // yaw and pitch from the forward vector drops roll, so the screen never
+  // arrives tilted sideways because the viewer's head happened to be.
+  const float fx = 2.0f * (q.x * q.z + q.w * q.y);
+  const float fy = 2.0f * (q.y * q.z - q.w * q.x);
+  const float fz = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
+  // OpenXR looks down -Z, so forward is the negated third column.
+  const float dirX = -fx;
+  const float dirY = -fy;
+  const float dirZ = -fz;
+
+  const float yaw = std::atan2(dirX, dirZ) + 3.14159265f;
+  const float pitch = s.tiltFree.load() ? std::asin(std::clamp(dirY, -1.0f, 1.0f)) : 0.0f;
+
+  // q = yaw about Y, then pitch about the rotated X.
+  const float cy = std::cos(yaw * 0.5f);
+  const float sy = std::sin(yaw * 0.5f);
+  const float cp = std::cos(pitch * 0.5f);
+  const float sp = std::sin(pitch * 0.5f);
 
   XrReferenceSpaceCreateInfo info{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
   info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
   info.poseInReferenceSpace.position = location.pose.position;
-  info.poseInReferenceSpace.orientation.x = 0.0f;
-  info.poseInReferenceSpace.orientation.y = std::sin(yaw * 0.5f);
-  info.poseInReferenceSpace.orientation.z = 0.0f;
-  info.poseInReferenceSpace.orientation.w = std::cos(yaw * 0.5f);
+  info.poseInReferenceSpace.orientation.x = cy * sp;
+  info.poseInReferenceSpace.orientation.y = sy * cp;
+  info.poseInReferenceSpace.orientation.z = -sy * sp;
+  info.poseInReferenceSpace.orientation.w = cy * cp;
 
   XrSpace recentred = XR_NULL_HANDLE;
   if (XR_FAILED(xrCreateReferenceSpace(s.session, &info, &recentred))) return false;
@@ -496,6 +524,8 @@ constexpr int kInputFocusBase = 20;
 constexpr int kInputBackgroundBase = 30;
 // Which screen preset is active (base + index).
 constexpr int kInputScreenBase = 40;
+// Whether the screen may tilt (base + 0 upright, base + 1 free).
+constexpr int kInputTiltBase = 50;
 
 
 XrPath ToPath(XrInstance instance, const char* text) {
@@ -813,6 +843,15 @@ void PollEvents(Session& s) {
   while (true) {
     event = {XR_TYPE_EVENT_DATA_BUFFER};
     if (xrPollEvent(s.instance, &event) != XR_SUCCESS) break;
+    if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+      // The viewer held the Meta button and recentred the headset. The screen
+      // should come with them -- that gesture means "put things in front of
+      // me", and leaving the picture where it was ignores the one request the
+      // system passes through.
+      LOGI("runtime recentre; moving the screen");
+      s.recenterRequested.store(true);
+      continue;
+    }
     if (event.type != XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) continue;
 
     const auto& changed = *reinterpret_cast<XrEventDataSessionStateChanged*>(&event);
@@ -885,6 +924,13 @@ void PollInput(Session& s, JNIEnv* env) {
       DispatchInput(env, kInputSeekBackward);
     } else if (focus == kButtonSeekForward) {
       DispatchInput(env, kInputSeekForward);
+    } else if (focus == kButtonTilt) {
+      const bool next = !s.tiltFree.load();
+      s.tiltFree.store(next);
+      // Applied at once, so the effect of the toggle is visible rather than
+      // waiting for the next recentre to reveal it.
+      s.recenterRequested.store(true);
+      DispatchInput(env, kInputTiltBase + (next ? 1 : 0));
     } else if (focus == kButtonScreen) {
       const int next = (s.screenPreset.load() + 1) % kScreenPresetCount;
       s.screenPreset.store(next);

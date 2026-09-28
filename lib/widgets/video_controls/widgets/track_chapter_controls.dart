@@ -114,9 +114,11 @@ class TrackChapterControls extends StatelessWidget {
     String? semanticValue,
     bool? checked,
     bool isActive = false,
+    Widget Function(Color color, double size)? iconBuilder,
   }) {
     return VideoControlButton(
       icon: icon,
+      iconBuilder: iconBuilder,
       tooltip: tooltip,
       semanticLabel: semanticLabel,
       semanticValue: semanticValue,
@@ -295,7 +297,26 @@ class TrackChapterControls extends StatelessWidget {
           buttons.add(
             _buildTrackButton(
               buttonIndex: currentIndex,
-              icon: Symbols.view_in_ar_rounded,
+              // Material Symbols has no headset glyph, and every near miss says
+              // something else: a cube is an AR object, a panorama is a photo,
+              // spectacles are spectacles. Two letters are unambiguous.
+              icon: Symbols.vrpano_rounded,
+              iconBuilder: (color, size) => SizedBox(
+                width: size,
+                height: size,
+                child: Center(
+                  child: Text(
+                    'VR',
+                    style: TextStyle(
+                      color: color,
+                      fontSize: size * 0.58,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: -0.5,
+                      height: 1.0,
+                    ),
+                  ),
+                ),
+              ),
               tooltip: t.videoControls.watchInVrButton,
               semanticLabel: t.videoControls.watchInVrButton,
               buttons: buttons,

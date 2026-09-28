@@ -622,6 +622,10 @@ extension _VideoPlayerPlaybackServiceMethods on VideoPlayerScreenState {
             'positionMs': position.inMilliseconds,
             'durationMs': (currentPlayer.state.duration as Duration).inMilliseconds,
             'title': _immersiveTitle,
+            // The headset previews a seek locally while the button is held,
+            // because the real position only lands once the seek completes and
+            // holding a control that shows nothing is seeking blind.
+            'seekStepMs': SettingsService.instance.read(SettingsService.seekTimeSmall) * 1000,
           })
           .catchError((Object error) {
             // The immersive activity may already be gone; the bar is not worth

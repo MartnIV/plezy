@@ -12,12 +12,23 @@ import android.util.Log
 import android.view.Surface
 import java.util.Locale
 
+/**
+ * The bar's non-transport controls.
+ *
+ * Drawn as paths rather than font glyphs: the bar is painted with Canvas onto
+ * a swapchain, so pulling in an icon font to render four shapes would cost an
+ * asset and a text-shaping pass for no gain in clarity.
+ */
+enum class BarIcon { SCREEN, TILT, EXIT, BACKGROUND }
+
 /** What the control bar shows. Pushed from Dart, which owns playback state. */
 data class ImmersivePlaybackStatus(
   val isPlaying: Boolean,
   val positionMs: Long,
   val durationMs: Long,
   val title: String,
+  /** The viewer's configured skip step, used to preview a held seek. */
+  val seekStepMs: Long = 10_000L,
 )
 
 /**
@@ -151,8 +162,9 @@ object ImmersiveOsd {
     target: Surface,
     status: ImmersivePlaybackStatus,
     notice: String? = null,
-    buttons: List<String> = emptyList(),
+    buttons: List<BarIcon> = emptyList(),
     focusedButton: Int = -1,
+    seeking: Boolean = false,
   ) {
     val canvas: Canvas = try {
       target.lockCanvas(null)
@@ -230,8 +242,16 @@ object ImmersiveOsd {
           )
         }
         progressPaint.shader = null
+        // While a seek is being previewed the knob grows and takes a halo, so
+        // the bar clearly reads as being moved rather than as having arrived.
         progressPaint.color = Color.rgb(232, 241, 255)
-        canvas.drawCircle(filledRight, railTop + railRadius, railHeight * 1.5f, progressPaint)
+        val knob = railHeight * if (seeking) 2.1f else 1.5f
+        if (seeking) {
+          accentPaint.shader = null
+          accentPaint.color = Color.argb(70, 130, 180, 255)
+          canvas.drawCircle(filledRight, railTop + railRadius, knob * 2.1f, accentPaint)
+        }
+        canvas.drawCircle(filledRight, railTop + railRadius, knob, progressPaint)
       }
 
       // Row 3: transport on the left, controls on the right -- the reading
@@ -245,11 +265,12 @@ object ImmersiveOsd {
       drawPlayControl(canvas, left + discRadius + step, rowCentre, discRadius, status.isPlaying, focusedButton == 1, h)
       drawSkipControl(canvas, left + discRadius + step * 2f, rowCentre, discRadius * 0.86f, true, focusedButton == 2, h)
 
-      // The pills get whatever is left to the right of the transport group,
-      // and shrink their labels rather than overrun it.
-      val transportRight = left + discRadius + step * 2f + discRadius
+      // Icon buttons, same size as the transport, laid out from the right.
+      // They no longer carry their value as text, so nothing here changes
+      // width as the viewer cycles a setting -- which is what kept colliding
+      // with the clock.
       if (buttons.isNotEmpty()) {
-        drawButtons(canvas, buttons, focusedButton - 3, transportRight + pad, right, rowCentre, h)
+        drawIconButtons(canvas, buttons, focusedButton - 3, right, rowCentre, discRadius * 0.86f, h)
       }
     } finally {
       try {
@@ -372,7 +393,118 @@ object ImmersiveOsd {
   }
 
   /** The control pills, laid out from the right along the transport row. */
-  private fun drawButtons(
+  /** Circular icon buttons, laid out from the right. */
+  private fun drawIconButtons(
+    canvas: Canvas,
+    icons: List<BarIcon>,
+    focused: Int,
+    right: Float,
+    centreY: Float,
+    radius: Float,
+    h: Float,
+  ) {
+    val gap = radius * 0.72f
+    // Leaving gets air around it. It is the only control here that ends the
+    // session rather than adjusting it, and a row of evenly spaced circles
+    // invites pressing the wrong one.
+    val isolationGap = radius * 2.1f
+    var cx = right - radius
+    for (index in icons.indices.reversed()) {
+      val isFocused = index == focused
+      if (isFocused) {
+        drawFocusRing(canvas, RectF(cx - radius, centreY - radius, cx + radius, centreY + radius), radius, h)
+      }
+      accentPaint.shader = null
+      if (isFocused) {
+        accentPaint.shader = android.graphics.LinearGradient(
+          cx, centreY - radius, cx, centreY + radius,
+          Color.rgb(162, 203, 255), Color.rgb(96, 150, 255),
+          android.graphics.Shader.TileMode.CLAMP,
+        )
+      } else {
+        accentPaint.color = Color.argb(40, 150, 190, 255)
+      }
+      canvas.drawCircle(cx, centreY, radius, accentPaint)
+      accentPaint.shader = null
+
+      val ink = if (isFocused) Color.rgb(9, 15, 28) else Color.rgb(202, 224, 255)
+      drawIcon(canvas, icons[index], cx, centreY, radius * 0.56f, ink)
+      cx -= radius * 2f + if (icons[index] == BarIcon.EXIT) isolationGap else gap
+    }
+  }
+
+  /**
+   * The icons themselves.
+   *
+   * Each is drawn inside a box of half-width [s] around ([cx], [cy]), stroked
+   * rather than filled so they read at a glance without turning into blobs at
+   * this size.
+   */
+  private fun drawIcon(canvas: Canvas, icon: BarIcon, cx: Float, cy: Float, s: Float, ink: Int) {
+    glyphPaint.color = ink
+    borderPaint.color = ink
+    borderPaint.strokeWidth = s * 0.20f
+    borderPaint.strokeCap = Paint.Cap.ROUND
+    borderPaint.strokeJoin = Paint.Join.ROUND
+
+    when (icon) {
+      // A screen with arrows pushing outward: size.
+      BarIcon.SCREEN -> {
+        val w = s * 0.92f
+        val hgt = s * 0.62f
+        canvas.drawRoundRect(RectF(cx - w, cy - hgt, cx + w, cy + hgt), s * 0.18f, s * 0.18f, borderPaint)
+        val a = s * 0.42f
+        canvas.drawLine(cx - a, cy, cx - a * 0.05f, cy, borderPaint)
+        canvas.drawLine(cx + a * 0.05f, cy, cx + a, cy, borderPaint)
+        // Arrowheads, so the direction is unmistakable.
+        canvas.drawLine(cx - a, cy, cx - a * 0.55f, cy - s * 0.20f, borderPaint)
+        canvas.drawLine(cx - a, cy, cx - a * 0.55f, cy + s * 0.20f, borderPaint)
+        canvas.drawLine(cx + a, cy, cx + a * 0.55f, cy - s * 0.20f, borderPaint)
+        canvas.drawLine(cx + a, cy, cx + a * 0.55f, cy + s * 0.20f, borderPaint)
+      }
+      // A tilted screen with an arc over it: the screen may lean.
+      BarIcon.TILT -> {
+        canvas.save()
+        canvas.rotate(-22f, cx, cy + s * 0.12f)
+        canvas.drawRoundRect(
+          RectF(cx - s * 0.80f, cy - s * 0.24f, cx + s * 0.80f, cy + s * 0.72f),
+          s * 0.16f, s * 0.16f, borderPaint,
+        )
+        canvas.restore()
+        val arc = RectF(cx - s * 0.72f, cy - s * 1.02f, cx + s * 0.72f, cy - s * 0.10f)
+        canvas.drawArc(arc, 200f, 140f, false, borderPaint)
+      }
+      // An arrow leaving a panel: the way back.
+      BarIcon.EXIT -> {
+        canvas.drawLine(cx + s * 0.16f, cy - s * 0.78f, cx + s * 0.78f, cy - s * 0.78f, borderPaint)
+        canvas.drawLine(cx + s * 0.78f, cy - s * 0.78f, cx + s * 0.78f, cy + s * 0.78f, borderPaint)
+        canvas.drawLine(cx + s * 0.16f, cy + s * 0.78f, cx + s * 0.78f, cy + s * 0.78f, borderPaint)
+        canvas.drawLine(cx - s * 0.82f, cy, cx + s * 0.26f, cy, borderPaint)
+        canvas.drawLine(cx - s * 0.82f, cy, cx - s * 0.34f, cy - s * 0.40f, borderPaint)
+        canvas.drawLine(cx - s * 0.82f, cy, cx - s * 0.34f, cy + s * 0.40f, borderPaint)
+      }
+      // Hills and a sun: the scene behind the screen.
+      BarIcon.BACKGROUND -> {
+        val box = RectF(cx - s * 0.88f, cy - s * 0.70f, cx + s * 0.88f, cy + s * 0.70f)
+        canvas.drawRoundRect(box, s * 0.18f, s * 0.18f, borderPaint)
+        glyphPaint.style = Paint.Style.FILL
+        canvas.drawCircle(cx + s * 0.40f, cy - s * 0.30f, s * 0.15f, glyphPaint)
+        val hills = android.graphics.Path().apply {
+          moveTo(cx - s * 0.80f, cy + s * 0.60f)
+          lineTo(cx - s * 0.22f, cy - s * 0.10f)
+          lineTo(cx + s * 0.16f, cy + s * 0.30f)
+          lineTo(cx + s * 0.44f, cy - s * 0.02f)
+          lineTo(cx + s * 0.80f, cy + s * 0.60f)
+          close()
+        }
+        canvas.drawPath(hills, glyphPaint)
+      }
+    }
+    borderPaint.strokeCap = Paint.Cap.BUTT
+    borderPaint.strokeJoin = Paint.Join.MITER
+  }
+
+  private fun drawButtonsUnused(
     canvas: Canvas,
     buttons: List<String>,
     focused: Int,

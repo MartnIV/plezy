@@ -85,11 +85,28 @@ object ImmersiveSession {
    */
   private const val OSD_VISIBLE_MS = 5_000L
 
+  /** How long the preview survives the last skip before the real position wins. */
+  private const val PREVIEW_HOLD_MS = 900L
+
   @Volatile
   private var lastStatus: ImmersivePlaybackStatus? = null
 
   @Volatile
   private var starfieldDrawn = false
+
+  /**
+   * Where a held seek has reached, shown on the bar before the player gets
+   * there.
+   *
+   * A real seek only reports its new position once it completes, and a held
+   * skip issues them faster than that, so the bar sat still while the viewer
+   * travelled -- holding a control and seeing nothing move is seeking blind.
+   * This advances by the configured step for every skip issued and is handed
+   * back to the real position once the player catches up.
+   */
+  @Volatile
+  private var previewPositionMs: Long? = null
+  private var previewClear: Runnable? = null
 
   @Synchronized
   fun showOsd(status: ImmersivePlaybackStatus, autoHide: Boolean = true) {
@@ -99,7 +116,8 @@ object ImmersiveSession {
       Log.w(TAG, "no OSD surface; the control bar cannot be drawn")
       return
     }
-    ImmersiveOsd.draw(surface, status, buttons = buttonLabels(), focusedButton = focusedButton)
+    ImmersiveOsd.draw(surface, withPreview(status), buttons = barIcons, focusedButton = focusedButton,
+      seeking = previewPositionMs != null)
     nativeSetOsdVisible(true)
     Log.i(TAG, "osd shown: ${status.positionMs}/${status.durationMs} playing=${status.isPlaying} focus=$focusedButton")
     osdHideRunnable?.let(osdHandler::removeCallbacks)
@@ -119,7 +137,8 @@ object ImmersiveSession {
   fun showNotice(text: String) {
     val status = lastStatus ?: ImmersivePlaybackStatus(false, 0, 0, "")
     val surface = nativeOsdSurface() ?: return
-    ImmersiveOsd.draw(surface, status, notice = text.ifEmpty { null }, buttons = buttonLabels(), focusedButton = focusedButton)
+    ImmersiveOsd.draw(surface, withPreview(status), notice = text.ifEmpty { null }, buttons = barIcons,
+      focusedButton = focusedButton, seeking = previewPositionMs != null)
     nativeSetOsdVisible(true)
     osdHideRunnable?.let(osdHandler::removeCallbacks)
     val hide = Runnable { nativeSetOsdVisible(false) }
@@ -128,12 +147,36 @@ object ImmersiveSession {
     Log.i(TAG, "osd notice: $text")
   }
 
+  /**
+   * Drops the preview a moment after the last skip.
+   *
+   * Not on the next position report: those arrive throughout a held seek and
+   * are always behind it, so clearing on one would snap the bar backwards
+   * mid-hold. Waiting until the skips stop lets the player catch up first.
+   */
+  private fun armPreviewExpiry() {
+    previewClear?.let(osdHandler::removeCallbacks)
+    val clear = Runnable {
+      previewPositionMs = null
+      lastStatus?.let { updateOsd(it) }
+    }
+    previewClear = clear
+    osdHandler.postDelayed(clear, PREVIEW_HOLD_MS)
+  }
+
+  /** Applies the preview, when one is running, to what the bar draws. */
+  private fun withPreview(status: ImmersivePlaybackStatus): ImmersivePlaybackStatus {
+    val preview = previewPositionMs ?: return status
+    return status.copy(positionMs = preview)
+  }
+
   /** Redraws without disturbing the hide countdown, for ticking the clock. */
   @Synchronized
   fun updateOsd(status: ImmersivePlaybackStatus) {
     lastStatus = status
     val surface = nativeOsdSurface() ?: return
-    ImmersiveOsd.draw(surface, status, buttons = buttonLabels(), focusedButton = focusedButton)
+    ImmersiveOsd.draw(surface, withPreview(status), buttons = barIcons, focusedButton = focusedButton,
+      seeking = previewPositionMs != null)
   }
 
   @Synchronized
@@ -185,6 +228,10 @@ object ImmersiveSession {
   private const val INPUT_FOCUS_BASE = 20
   private const val INPUT_BACKGROUND_BASE = 30
   private const val INPUT_SCREEN_BASE = 40
+  private const val INPUT_TILT_BASE = 50
+
+  @Volatile
+  private var tiltFree = false
 
   private val screenLabels = arrayOf("Close", "Standard", "Cinema")
 
@@ -216,11 +263,14 @@ object ImmersiveSession {
    * The pills on the right. The three transport controls to their left are
    * drawn as glyphs and occupy focus 0, 1 and 2, so these start at 3.
    */
-  private fun buttonLabels(): List<String> = listOf(
-    "Screen: ${screenLabels.getOrElse(screenPreset) { "?" }}",
-    "Back to panel",
-    "Background: ${backgroundLabels.getOrElse(backgroundMode) { "?" }}",
-  )
+  /**
+   * The bar's right-hand controls, as icons.
+   *
+   * They carried their current value as text until the labels grew and
+   * collided with the clock; the value is announced in the bar's headline when
+   * it changes instead, which is when it matters.
+   */
+  private val barIcons = listOf(BarIcon.SCREEN, BarIcon.TILT, BarIcon.BACKGROUND, BarIcon.EXIT)
 
   private val stereoLabels = arrayOf("2D", "3D side-by-side", "3D top/bottom")
 
@@ -228,6 +278,11 @@ object ImmersiveSession {
   fun onInputFromNative(action: Int) {
     if (action == INPUT_EXIT) {
       onSessionEnded?.invoke()
+      return
+    }
+    if (action >= INPUT_TILT_BASE) {
+      tiltFree = (action - INPUT_TILT_BASE) == 1
+      showNotice(if (tiltFree) "Screen follows your view" else "Screen stays upright")
       return
     }
     if (action >= INPUT_SCREEN_BASE) {
@@ -270,9 +325,16 @@ object ImmersiveSession {
       INPUT_SEEK_FORWARD -> "seekForward"
       else -> return
     }
+    val status = lastStatus
+    if (status != null && (action == INPUT_SEEK_FORWARD || action == INPUT_SEEK_BACKWARD)) {
+      val from = previewPositionMs ?: status.positionMs
+      val step = if (action == INPUT_SEEK_FORWARD) status.seekStepMs else -status.seekStepMs
+      previewPositionMs = (from + step).coerceIn(0L, status.durationMs.coerceAtLeast(0L))
+      armPreviewExpiry()
+    }
     // Any press brings the bar back: pressing a button and seeing nothing
     // change is the worst outcome when there is no other feedback.
-    lastStatus?.let { showOsd(it) }
+    status?.let { showOsd(it) }
     val channel = MainActivity.immersiveInputChannel ?: return
     Handler(Looper.getMainLooper()).post {
       try {

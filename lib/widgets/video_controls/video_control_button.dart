@@ -42,6 +42,14 @@ class VideoControlButton extends StatelessWidget {
   /// When provided, the button becomes focusable with visual focus indicator.
   final FocusNode? focusNode;
 
+  /// Draws something other than [icon], given the colour and size the button
+  /// would have used.
+  ///
+  /// For controls with no icon in the set: the immersive hand-off is labelled
+  /// "VR" because Material Symbols has no headset glyph, and every near miss
+  /// (an AR cube, a panorama, a pair of spectacles) says something else.
+  final Widget Function(Color color, double size)? iconBuilder;
+
   /// Custom key event handler for focus navigation.
   final KeyEventResult Function(FocusNode, KeyEvent)? onKeyEvent;
 
@@ -61,6 +69,7 @@ class VideoControlButton extends StatelessWidget {
     this.checked,
     this.isActive = false,
     this.focusNode,
+    this.iconBuilder,
     this.onKeyEvent,
     this.onFocusChange,
     this.autofocus = false,
@@ -72,7 +81,7 @@ class VideoControlButton extends StatelessWidget {
     final effectiveSemanticLabel = semanticLabel ?? tooltip;
 
     Widget button(Color iconColor) => IconButton(
-      icon: AppIcon(icon, fill: 1, color: iconColor, size: iconSize),
+      icon: iconBuilder?.call(iconColor, iconSize) ?? AppIcon(icon, fill: 1, color: iconColor, size: iconSize),
       iconSize: iconSize,
       onPressed: onPressed,
       tooltip: tooltip,

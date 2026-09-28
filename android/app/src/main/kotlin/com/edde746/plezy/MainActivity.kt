@@ -928,6 +928,7 @@ class MainActivity : FlutterActivity() {
               positionMs = (call.argument<Number>("positionMs") ?: 0).toLong(),
               durationMs = (call.argument<Number>("durationMs") ?: 0).toLong(),
               title = call.argument<String>("title").orEmpty(),
+              seekStepMs = (call.argument<Number>("seekStepMs") ?: 10_000).toLong(),
             )
             if (call.method == "showStatus") {
               ImmersiveSession.showOsd(status)

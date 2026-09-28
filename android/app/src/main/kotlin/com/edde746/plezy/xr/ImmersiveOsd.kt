@@ -1,5 +1,8 @@
 package com.edde746.plezy.xr
 
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -31,10 +34,29 @@ data class ImmersivePlaybackStatus(
  */
 object ImmersiveOsd {
   private const val TAG = "PlezyXR"
+  private const val SPACE_ASSET = "space_background.jpg"
 
-  private val backgroundPaint = Paint().apply {
+  private val panelPaint = Paint().apply { isAntiAlias = true }
+  private val shadowPaint = Paint().apply {
     isAntiAlias = true
-    color = Color.argb(200, 12, 12, 16)
+    color = Color.argb(200, 8, 9, 14)
+  }
+  private val borderPaint = Paint().apply {
+    isAntiAlias = true
+    style = Paint.Style.STROKE
+  }
+  private val accentPaint = Paint().apply { isAntiAlias = true }
+  private val titlePaint = Paint().apply {
+    isAntiAlias = true
+    typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
+  }
+  private val timePaint = Paint().apply {
+    isAntiAlias = true
+    typeface = android.graphics.Typeface.create("sans-serif", android.graphics.Typeface.NORMAL)
+  }
+  private val labelPaint = Paint().apply {
+    isAntiAlias = true
+    typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
   }
   private val trackPaint = Paint().apply {
     isAntiAlias = true
@@ -44,10 +66,7 @@ object ImmersiveOsd {
     isAntiAlias = true
     color = Color.rgb(120, 170, 255)
   }
-  private val textPaint = Paint().apply {
-    isAntiAlias = true
-    color = Color.WHITE
-  }
+
   private val glyphPaint = Paint().apply {
     isAntiAlias = true
     color = Color.WHITE
@@ -67,49 +86,65 @@ object ImmersiveOsd {
    * enormously, and an even scatter here would clump into two bright caps
    * overhead and underfoot.
    */
-  fun drawStarfield(target: Surface) {
+  /**
+   * Paints the space background from the bundled equirectangular panorama.
+   *
+   * A real photograph rather than procedural shapes: gradients and dots can
+   * suggest a sky but never carry the dust lanes, clustering and fine
+   * structure that make one look real, which is why the drawn version kept
+   * reading as cheap however much detail was piled into it.
+   *
+   * The asset is ESO/S. Brunier's Milky Way panorama under CC BY 4.0, colour
+   * graded toward pink and darkened; see the attribution file beside it. It is
+   * already 360x180 equirectangular, so it maps straight onto the background
+   * layer with no reprojection.
+   */
+  fun drawStarfield(target: Surface, context: Context) {
+    val bitmap = try {
+      context.assets.open(SPACE_ASSET).use { stream ->
+        // 565 halves the decode: the panorama has no alpha, and at this size
+        // the full-colour copy is tens of megabytes held only to be blitted
+        // once and thrown away.
+        val options = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 }
+        BitmapFactory.decodeStream(stream, null, options)
+      }
+    } catch (error: Throwable) {
+      Log.w(TAG, "could not decode the space background", error)
+      null
+    }
+    if (bitmap == null) {
+      Log.w(TAG, "no space background; leaving the sky black")
+      return
+    }
+
     val canvas: Canvas = try {
       target.lockCanvas(null)
     } catch (error: Throwable) {
       Log.w(TAG, "could not lock the starfield surface", error)
+      bitmap.recycle()
       return
     }
     try {
-      val w = canvas.width
-      val h = canvas.height
-      canvas.drawColor(Color.rgb(3, 4, 10))
-
-      // Fixed seed: the sky should be the same every time rather than
-      // rearranging itself between films.
-      val random = java.util.Random(0x51A25)
-      val paint = Paint().apply { isAntiAlias = true }
-      repeat(3000) {
-        val x = random.nextFloat() * w
-        val v = random.nextFloat()
-        val y = v * h
-        // Density falls off with the projection's vertical stretch.
-        val latitude = (v - 0.5) * Math.PI
-        if (random.nextFloat() > Math.cos(latitude)) return@repeat
-
-        val brightness = random.nextFloat()
-        val alpha = (60 + brightness * 195).toInt().coerceIn(0, 255)
-        // A few stars lean warm or cool; a uniformly white sky looks printed.
-        val tint = random.nextFloat()
-        paint.color = when {
-          tint > 0.93f -> Color.argb(alpha, 255, 220, 190)
-          tint < 0.07f -> Color.argb(alpha, 200, 220, 255)
-          else -> Color.argb(alpha, 255, 255, 255)
-        }
-        canvas.drawCircle(x, y, 0.6f + brightness * 1.4f, paint)
+      canvas.drawColor(Color.BLACK)
+      val paint = Paint().apply {
+        isAntiAlias = true
+        isFilterBitmap = true
       }
+      canvas.drawBitmap(
+        bitmap,
+        null,
+        RectF(0f, 0f, canvas.width.toFloat(), canvas.height.toFloat()),
+        paint,
+      )
     } finally {
       try {
         target.unlockCanvasAndPost(canvas)
       } catch (error: Throwable) {
         Log.w(TAG, "could not post the starfield", error)
       }
+      bitmap.recycle()
     }
-    Log.i(TAG, "starfield drawn")
+    Log.i(TAG, "space background drawn")
   }
 
   fun draw(
@@ -132,66 +167,109 @@ object ImmersiveOsd {
       // buffer is free, which still holds an older frame's content.
       canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
 
-      val radius = h * 0.22f
-      canvas.drawRoundRect(RectF(0f, 0f, w, h), radius, radius, backgroundPaint)
+      val inset = h * 0.06f
+      val body = RectF(inset, inset, w - inset, h - inset)
+      val radius = body.height() * 0.28f
 
-      val padding = h * 0.18f
-      val glyphSize = h * 0.30f
-      val glyphCentreX = padding + glyphSize * 0.6f
-      val glyphCentreY = h * 0.42f
+      // A soft drop shadow lifts the bar off whatever is behind it. Against
+      // passthrough especially, an unshadowed panel looks pasted on.
+      shadowPaint.setShadowLayer(h * 0.10f, 0f, h * 0.025f, Color.argb(160, 0, 0, 0))
+      canvas.drawRoundRect(body, radius, radius, shadowPaint)
+
+      // Vertical gradient rather than a flat fill: flat panels are exactly
+      // what reads as unfinished.
+      panelPaint.shader = android.graphics.LinearGradient(
+        0f, body.top, 0f, body.bottom,
+        Color.argb(234, 26, 28, 36), Color.argb(238, 14, 15, 20),
+        android.graphics.Shader.TileMode.CLAMP,
+      )
+      canvas.drawRoundRect(body, radius, radius, panelPaint)
+      panelPaint.shader = null
+
+      // A hairline top edge, the way a lit surface catches light.
+      borderPaint.strokeWidth = h * 0.008f
+      borderPaint.color = Color.argb(46, 255, 255, 255)
+      canvas.drawRoundRect(body, radius, radius, borderPaint)
+
+      val padding = h * 0.16f
+      val left = body.left + padding
+      val right = body.right - padding
+      val titleBaseline = body.top + h * 0.30f
+
+      // Play state, as a filled disc so it reads at a glance from across a
+      // virtual room rather than as a bare glyph.
+      val discRadius = h * 0.115f
+      val discX = left + discRadius
+      val discY = body.top + h * 0.26f
+      accentPaint.color = Color.argb(38, 150, 190, 255)
+      canvas.drawCircle(discX, discY, discRadius, accentPaint)
+      glyphPaint.color = Color.rgb(196, 220, 255)
       if (status.isPlaying) {
-        // Pause: two bars.
-        val barWidth = glyphSize * 0.28f
-        val gap = glyphSize * 0.22f
-        val top = glyphCentreY - glyphSize / 2f
-        val bottom = glyphCentreY + glyphSize / 2f
-        canvas.drawRect(glyphCentreX - gap / 2f - barWidth, top, glyphCentreX - gap / 2f, bottom, glyphPaint)
-        canvas.drawRect(glyphCentreX + gap / 2f, top, glyphCentreX + gap / 2f + barWidth, bottom, glyphPaint)
+        val barW = discRadius * 0.24f
+        val barH = discRadius * 0.86f
+        val gap = discRadius * 0.24f
+        canvas.drawRoundRect(
+          RectF(discX - gap / 2f - barW, discY - barH / 2f, discX - gap / 2f, discY + barH / 2f),
+          barW * 0.4f, barW * 0.4f, glyphPaint,
+        )
+        canvas.drawRoundRect(
+          RectF(discX + gap / 2f, discY - barH / 2f, discX + gap / 2f + barW, discY + barH / 2f),
+          barW * 0.4f, barW * 0.4f, glyphPaint,
+        )
       } else {
-        // Play: a triangle.
         val path = android.graphics.Path().apply {
-          moveTo(glyphCentreX - glyphSize * 0.3f, glyphCentreY - glyphSize / 2f)
-          lineTo(glyphCentreX - glyphSize * 0.3f, glyphCentreY + glyphSize / 2f)
-          lineTo(glyphCentreX + glyphSize * 0.45f, glyphCentreY)
+          moveTo(discX - discRadius * 0.30f, discY - discRadius * 0.48f)
+          lineTo(discX - discRadius * 0.30f, discY + discRadius * 0.48f)
+          lineTo(discX + discRadius * 0.52f, discY)
           close()
         }
         canvas.drawPath(path, glyphPaint)
       }
 
-      textPaint.textSize = h * 0.20f
-      textPaint.textAlign = Paint.Align.LEFT
-      val titleX = glyphCentreX + glyphSize
+      val textLeft = discX + discRadius + padding * 0.75f
+
+      // The clock is measured first so the title can be told how much room is
+      // actually left, instead of being ellipsized against a guess.
+      timePaint.textSize = h * 0.115f
+      timePaint.textAlign = Paint.Align.RIGHT
+      timePaint.color = Color.argb(205, 208, 214, 230)
+      val clock = "${formatTime(status.positionMs)}  /  ${formatTime(status.durationMs)}"
+      val clockWidth = timePaint.measureText(clock)
+      canvas.drawText(clock, right, titleBaseline, timePaint)
+
+      titlePaint.textSize = h * 0.145f
+      titlePaint.textAlign = Paint.Align.LEFT
       val headline = notice ?: status.title
-      if (notice != null) textPaint.color = Color.rgb(150, 200, 255)
-      val title = ellipsize(headline, textPaint, w - titleX - padding * 6f)
-      canvas.drawText(title, titleX, h * 0.36f, textPaint)
-      textPaint.color = Color.WHITE
+      titlePaint.color = if (notice != null) Color.rgb(150, 196, 255) else Color.rgb(242, 244, 250)
+      val available = right - clockWidth - padding - textLeft
+      canvas.drawText(ellipsize(headline, titlePaint, available), textLeft, titleBaseline, titlePaint)
 
-      textPaint.textSize = h * 0.17f
-      textPaint.textAlign = Paint.Align.RIGHT
-      val clock = "${formatTime(status.positionMs)} / ${formatTime(status.durationMs)}"
-      canvas.drawText(clock, w - padding, h * 0.36f, textPaint)
-
-      if (buttons.isNotEmpty()) drawButtons(canvas, buttons, focusedButton, w, h, padding)
-
-      val barTop = h * 0.60f
-      val barHeight = h * 0.10f
-      val barLeft = padding
-      val barRight = w - padding
-      val barRadius = barHeight / 2f
-      canvas.drawRoundRect(RectF(barLeft, barTop, barRight, barTop + barHeight), barRadius, barRadius, trackPaint)
+      // Progress, as a thin rounded rail with a knob -- the knob is what makes
+      // the position readable at a distance.
+      val railHeight = h * 0.042f
+      val railTop = body.top + h * 0.46f
+      val railRadius = railHeight / 2f
+      trackPaint.color = Color.argb(70, 150, 158, 180)
+      canvas.drawRoundRect(RectF(left, railTop, right, railTop + railHeight), railRadius, railRadius, trackPaint)
       if (status.durationMs > 0) {
         val fraction = (status.positionMs.toFloat() / status.durationMs).coerceIn(0f, 1f)
-        val filledRight = barLeft + (barRight - barLeft) * fraction
-        if (filledRight > barLeft) {
+        val filledRight = left + (right - left) * fraction
+        progressPaint.shader = android.graphics.LinearGradient(
+          left, 0f, right, 0f,
+          Color.rgb(96, 150, 255), Color.rgb(150, 196, 255),
+          android.graphics.Shader.TileMode.CLAMP,
+        )
+        if (filledRight > left) {
           canvas.drawRoundRect(
-            RectF(barLeft, barTop, filledRight, barTop + barHeight),
-            barRadius,
-            barRadius,
-            progressPaint,
+            RectF(left, railTop, filledRight, railTop + railHeight), railRadius, railRadius, progressPaint,
           )
         }
+        progressPaint.shader = null
+        progressPaint.color = Color.rgb(226, 238, 255)
+        canvas.drawCircle(filledRight, railTop + railRadius, railHeight * 1.05f, progressPaint)
       }
+
+      if (buttons.isNotEmpty()) drawButtons(canvas, buttons, focusedButton, left, right, body.bottom, h)
     } finally {
       try {
         target.unlockCanvasAndPost(canvas)
@@ -202,47 +280,62 @@ object ImmersiveOsd {
   }
 
   /**
-   * The button row, laid out from the right.
+   * The button row, laid out from the right along the bar's lower edge.
    *
-   * Only the focused button is drawn filled. Nothing here is pointed at, so
-   * there is no hover state to show and no reason to make the others compete
-   * with the film for attention.
+   * Nothing here is pointed at, so there is no hover state: the focused button
+   * is filled and ringed, the rest are quiet outlines that do not compete with
+   * the film.
    */
   private fun drawButtons(
     canvas: Canvas,
     buttons: List<String>,
     focused: Int,
-    w: Float,
+    left: Float,
+    right: Float,
+    bottom: Float,
     h: Float,
-    padding: Float,
   ) {
-    val buttonHeight = h * 0.26f
-    val top = h * 0.74f - buttonHeight / 2f
-    val textSize = h * 0.15f
-    textPaint.textSize = textSize
-    textPaint.textAlign = Paint.Align.CENTER
+    val height = h * 0.185f
+    val top = bottom - height - h * 0.10f
+    labelPaint.textSize = h * 0.098f
+    labelPaint.textAlign = Paint.Align.CENTER
 
-    var right = w - padding
+    var edge = right
     for (index in buttons.indices.reversed()) {
       val label = buttons[index]
-      val width = textPaint.measureText(label) + h * 0.30f
-      val left = right - width
-      val rect = RectF(left, top, right, top + buttonHeight)
-      val radius = buttonHeight / 2f
+      val width = labelPaint.measureText(label) + height * 1.25f
+      val rect = RectF(edge - width, top, edge, top + height)
+      val radius = height / 2f
+      val isFocused = index == focused
 
-      if (index == focused) {
-        progressPaint.color = Color.rgb(120, 170, 255)
-        canvas.drawRoundRect(rect, radius, radius, progressPaint)
-        textPaint.color = Color.rgb(8, 12, 20)
+      if (isFocused) {
+        // A halo outside the pill, so the focused control is obvious without
+        // the bar having to get louder overall.
+        accentPaint.color = Color.argb(60, 120, 170, 255)
+        canvas.drawRoundRect(
+          RectF(rect.left - h * 0.022f, rect.top - h * 0.022f, rect.right + h * 0.022f, rect.bottom + h * 0.022f),
+          radius + h * 0.022f, radius + h * 0.022f, accentPaint,
+        )
+        accentPaint.shader = android.graphics.LinearGradient(
+          rect.left, rect.top, rect.left, rect.bottom,
+          Color.rgb(150, 196, 255), Color.rgb(92, 146, 250),
+          android.graphics.Shader.TileMode.CLAMP,
+        )
+        canvas.drawRoundRect(rect, radius, radius, accentPaint)
+        accentPaint.shader = null
+        labelPaint.color = Color.rgb(10, 16, 30)
       } else {
+        trackPaint.color = Color.argb(56, 140, 150, 175)
         canvas.drawRoundRect(rect, radius, radius, trackPaint)
-        textPaint.color = Color.argb(220, 235, 235, 240)
+        borderPaint.strokeWidth = h * 0.006f
+        borderPaint.color = Color.argb(48, 210, 218, 235)
+        canvas.drawRoundRect(rect, radius, radius, borderPaint)
+        labelPaint.color = Color.argb(224, 226, 232, 245)
       }
-      canvas.drawText(label, (left + right) / 2f, top + buttonHeight * 0.70f, textPaint)
-      right = left - padding * 0.5f
+      // Optical centring: text sits slightly above the geometric middle.
+      canvas.drawText(label, rect.centerX(), rect.centerY() + labelPaint.textSize * 0.35f, labelPaint)
+      edge = rect.left - h * 0.05f
     }
-    textPaint.color = Color.WHITE
-    textPaint.textAlign = Paint.Align.LEFT
   }
 
   private fun ellipsize(text: String, paint: Paint, maxWidth: Float): String {

@@ -135,6 +135,10 @@ object ImmersiveSession {
 
   private var loaded = false
 
+  /** Application context, kept so the background can be read from assets. */
+  @Volatile
+  private var appContext: android.content.Context? = null
+
   /**
    * Notified when the runtime ends the session -- the Meta button, the headset
    * coming off, the system menu. The activity has to finish itself then:
@@ -196,8 +200,12 @@ object ImmersiveSession {
       // Painted the first time it is asked for: most sessions never show it,
       // and three thousand stars is not work to do for nobody.
       if (backgroundMode == 1 && !starfieldDrawn) {
-        nativeStarfieldSurface()?.let {
-          ImmersiveOsd.drawStarfield(it)
+        val sky = nativeStarfieldSurface()
+        val context = appContext
+        if (sky == null || context == null) {
+          Log.w(TAG, "no starfield surface or context; the space background will be black")
+        } else {
+          ImmersiveOsd.drawStarfield(sky, context)
           starfieldDrawn = true
         }
       }
@@ -244,6 +252,12 @@ object ImmersiveSession {
         return null
       }
     }
+    // Every session builds new swapchains, so anything painted into the last
+    // one is gone: the flag must not survive the session that set it, or the
+    // sky is drawn once ever and is black on every subsequent visit.
+    starfieldDrawn = false
+    focusedButton = -1
+    appContext = activity.applicationContext
     return nativeStart(activity, width, height)
   }
 
@@ -270,6 +284,8 @@ object ImmersiveSession {
 class ImmersivePlayerActivity : Activity() {
   private var surface: Surface? = null
   private var attachedToPlayer = false
+  private val returnHandler = Handler(Looper.getMainLooper())
+  private var pendingReturn: Runnable? = null
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
@@ -362,21 +378,37 @@ class ImmersivePlayerActivity : Activity() {
   }
 
   /**
-   * Leaving is decided here rather than from the session's state.
+   * Being stopped is not leaving, and no timeout can tell the two apart.
    *
-   * The runtime passes through XR_SESSION_STATE_STOPPING as a matter of
-   * course -- including moments after the session starts -- so treating that
-   * as the viewer leaving killed the session almost immediately. onStop is
-   * Android telling us this activity is no longer on screen, which is the
-   * thing that actually means they have gone.
+   * Horizon OS stops this activity for its own interruptions, the
+   * roomscale/stationary boundary prompt above all -- which appears the moment
+   * an app goes immersive, and stays up until a human reads and answers it.
+   * A grace period long enough for that is long enough to be useless as a
+   * departure signal, so leaving is driven by the viewer instead: B, Y, or the
+   * button on the bar. The runtime's own EXITING state still ends the session.
+   *
+   * What remains here is caretaking, not a way out: an activity left stopped
+   * for a long stretch is one nobody came back to, and holding an OpenXR
+   * session and a redirected video surface open for it serves no one.
    */
   override fun onStop() {
     super.onStop()
-    if (!isFinishing) returnToPanel()
+    if (isFinishing) return
+    val pending = Runnable { if (!isFinishing && !isDestroyed) returnToPanel() }
+    pendingReturn = pending
+    returnHandler.postDelayed(pending, ABANDONED_SESSION_MS)
+  }
+
+  override fun onStart() {
+    super.onStart()
+    pendingReturn?.let(returnHandler::removeCallbacks)
+    pendingReturn = null
   }
 
   override fun onDestroy() {
     super.onDestroy()
+    pendingReturn?.let(returnHandler::removeCallbacks)
+    pendingReturn = null
     ImmersiveSession.onSessionEnded = null
     // Order matters: the player has to let go of the swapchain surface before
     // the session tears it down, or mpv keeps writing into freed buffers.
@@ -393,5 +425,14 @@ class ImmersivePlayerActivity : Activity() {
 
     /** The panel's task id, so leaving can raise it rather than clone it. */
     const val EXTRA_PANEL_TASK_ID = "plezy.panel_task_id"
+
+    /**
+     * How long a stopped activity may sit before it is treated as abandoned.
+     *
+     * Deliberately generous: this is cleanup for a session nobody returned to,
+     * not the route back to the panel. Anything short enough to feel like a
+     * way out also fires while the viewer is answering a system prompt.
+     */
+    private const val ABANDONED_SESSION_MS = 120_000L
   }
 }

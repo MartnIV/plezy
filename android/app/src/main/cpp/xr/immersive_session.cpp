@@ -15,6 +15,7 @@
 #include <android/log.h>
 #include <android/native_window_jni.h>
 #include <jni.h>
+#include <sys/system_properties.h>
 
 #include <atomic>
 #include <cmath>
@@ -40,6 +41,40 @@
 
 namespace {
 
+// Development switches, read once per session from system properties, so a
+// visual artefact can be bisected with `adb shell setprop` instead of one
+// build per hypothesis. A build cycle here is minutes plus someone putting a
+// headset on, which is far too slow a loop for elimination.
+//
+//   adb shell setprop debug.plezy.xr.no_passthrough_ext 1
+//   adb shell setprop debug.plezy.xr.no_sharpen 1
+//   adb shell setprop debug.plezy.xr.no_extra_swapchains 1
+//   adb shell setprop debug.plezy.xr.no_video_layer 1
+struct DebugSwitches {
+  bool noPassthroughExtension = false;
+  bool sharpen = false;
+  bool noExtraSwapchains = false;
+  bool noVideoLayer = false;
+
+  static bool Flag(const char* name) {
+    char value[PROP_VALUE_MAX] = {0};
+    if (__system_property_get(name, value) <= 0) return false;
+    return value[0] == '1';
+  }
+
+  void Load() {
+    noPassthroughExtension = Flag("debug.plezy.xr.no_passthrough_ext");
+    sharpen = Flag("debug.plezy.xr.sharpen");
+    noExtraSwapchains = Flag("debug.plezy.xr.no_extra_swapchains");
+    noVideoLayer = Flag("debug.plezy.xr.no_video_layer");
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                        "debug switches: passthrough_ext=%d sharpen=%d extra_swapchains=%d video_layer=%d",
+                        !noPassthroughExtension, sharpen, !noExtraSwapchains, !noVideoLayer);
+  }
+};
+
+DebugSwitches g_debug;
+
 // Screen geometry. A cylinder rather than a flat quad because a wide flat panel
 // at close range forces the eyes to refocus toward its edges; curving it keeps
 // every point equidistant. These are the starting values -- the whole point of
@@ -54,9 +89,11 @@ constexpr float kScreenHeightOffsetMeters = 0.0f;
 // covers the film.
 constexpr float kOsdDistanceMeters = 2.6f;
 constexpr float kOsdHeightOffsetMeters = -0.75f;
-constexpr float kOsdWidthMeters = 1.6f;
-constexpr int kOsdPixelWidth = 1024;
-constexpr int kOsdPixelHeight = 192;
+constexpr float kOsdWidthMeters = 1.5f;
+// Higher than the bar strictly needs on screen, because it is magnified
+// across a metre and a half of virtual width and every soft edge shows.
+constexpr int kOsdPixelWidth = 1792;
+constexpr int kOsdPixelHeight = 320;
 
 // How a 3D film packs both eyes into one picture. Nothing detects this: the
 // container rarely says, and guessing wrong is worse than asking, so the
@@ -69,8 +106,14 @@ enum class Background { Black = 0, Space = 1, Passthrough = 2 };
 // The starfield's equirect texture. Wide and short because it wraps the whole
 // horizon but most of it is empty sky; stars are points, so resolution buys
 // little beyond this.
-constexpr int kStarfieldWidth = 2048;
-constexpr int kStarfieldHeight = 1024;
+// 4096x2048 over a full sphere puts roughly a thousand pixels across the
+// field of view. 2048 wide looked soft because a Quest 3 eye sees about a
+// quarter of the horizon at once, so half the texture's width was being
+// magnified across the whole display.
+// Matches the bundled panorama exactly, so it maps onto the sphere without
+// being resampled on the way in.
+constexpr int kStarfieldWidth = 6000;
+constexpr int kStarfieldHeight = 3000;
 
 // The control bar's buttons, navigated with the stick rather than pointed at.
 constexpr int kButtonCount = 2;
@@ -96,6 +139,10 @@ struct Session {
   XrSwapchain swapchain = XR_NULL_HANDLE;
   XrSwapchain osdSwapchain = XR_NULL_HANDLE;
   jobject osdSurface = nullptr;  // global ref
+  // mpv's own OSD plane, the same size as the picture and composited over it
+  // with the same geometry, so subtitles land where the player put them.
+  XrSwapchain subtitleSwapchain = XR_NULL_HANDLE;
+  jobject subtitleSurface = nullptr;  // global ref
   std::atomic<bool> osdVisible{false};
   XrSessionState state = XR_SESSION_STATE_UNKNOWN;
 
@@ -215,7 +262,7 @@ void DestroyEgl(Session& s) {
 }
 
 bool CreateInstanceAndSystem(Session& s) {
-  const char* extensions[] = {
+  std::vector<const char*> extensions{
       XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
       XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
       "XR_KHR_android_surface_swapchain",
@@ -227,9 +274,10 @@ bool CreateInstanceAndSystem(Session& s) {
       "XR_FB_composition_layer_settings",
       // Lets the headset run at a multiple of the film's frame rate.
       "XR_FB_display_refresh_rate",
-      // The room behind the screen, when the viewer wants it.
-      "XR_FB_passthrough",
   };
+  // The room behind the screen. Separated so it can be left out while
+  // bisecting a visual artefact.
+  if (!g_debug.noPassthroughExtension) extensions.push_back("XR_FB_passthrough");
 
   XrInstanceCreateInfoAndroidKHR androidInfo{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
   androidInfo.applicationVM = s.vm;
@@ -237,8 +285,8 @@ bool CreateInstanceAndSystem(Session& s) {
 
   XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO};
   createInfo.next = &androidInfo;
-  createInfo.enabledExtensionCount = sizeof(extensions) / sizeof(extensions[0]);
-  createInfo.enabledExtensionNames = extensions;
+  createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+  createInfo.enabledExtensionNames = extensions.data();
   std::strncpy(createInfo.applicationInfo.applicationName, "Plezy", XR_MAX_APPLICATION_NAME_SIZE - 1);
   createInfo.applicationInfo.applicationVersion = 1;
   std::strncpy(createInfo.applicationInfo.engineName, "plezy_xr", XR_MAX_ENGINE_NAME_SIZE - 1);
@@ -531,6 +579,8 @@ bool CreateSurfaceSwapchain(Session& s, JNIEnv* env) {
   // anything composited into it would be overwritten immediately, and keeping
   // them apart also means the bar can appear and disappear without touching
   // the film.
+  if (g_debug.noExtraSwapchains) return true;
+
   XrSwapchainCreateInfo osdInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
   osdInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
   osdInfo.width = kOsdPixelWidth;
@@ -571,6 +621,30 @@ bool CreateSurfaceSwapchain(Session& s, JNIEnv* env) {
   }
   s.starfieldSurface = env->NewGlobalRef(localStarSurface);
   LOGI("starfield swapchain ready %dx%d", kStarfieldWidth, kStarfieldHeight);
+
+  // Subtitles: mpv renders them into their own plane rather than burning them
+  // into the picture, which is why the panel has a separate OSD SurfaceView.
+  // Without an equivalent here they simply vanish on the big screen.
+  XrSwapchainCreateInfo subtitleInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+  subtitleInfo.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+  subtitleInfo.width = static_cast<uint32_t>(s.width);
+  subtitleInfo.height = static_cast<uint32_t>(s.height);
+  subtitleInfo.format = 0;
+  subtitleInfo.faceCount = 0;
+  subtitleInfo.arraySize = 0;
+  subtitleInfo.mipCount = 0;
+  subtitleInfo.sampleCount = 0;
+
+  jobject localSubtitleSurface = nullptr;
+  const XrResult subtitleResult =
+      createSurfaceSwapchain(s.session, &subtitleInfo, &s.subtitleSwapchain, &localSubtitleSurface);
+  if (XR_FAILED(subtitleResult) || localSubtitleSurface == nullptr) {
+    LOGE("could not create the subtitle swapchain: %d", subtitleResult);
+    s.subtitleSwapchain = XR_NULL_HANDLE;
+    return true;
+  }
+  s.subtitleSurface = env->NewGlobalRef(localSubtitleSurface);
+  LOGI("subtitle swapchain ready %dx%d", s.width, s.height);
   return true;
 }
 
@@ -621,6 +695,29 @@ bool EnsurePassthrough(Session& s) {
   s.passthroughStarted = true;
   LOGI("passthrough started");
   return true;
+}
+
+// Stops passthrough when the viewer picks another background.
+//
+// Starting it without ever stopping it leaves the service running for the rest
+// of the session: cameras and power spent on something nothing is compositing,
+// and the reconstruction can still be faintly visible even though its layer is
+// no longer submitted.
+void PausePassthrough(Session& s) {
+  if (!s.passthroughStarted || s.passthrough == XR_NULL_HANDLE) return;
+  PFN_xrPassthroughPauseFB pausePassthrough = nullptr;
+  if (XR_FAILED(xrGetInstanceProcAddr(s.instance, "xrPassthroughPauseFB",
+                                      reinterpret_cast<PFN_xrVoidFunction*>(&pausePassthrough))) ||
+      pausePassthrough == nullptr) {
+    return;
+  }
+  const XrResult paused = pausePassthrough(s.passthrough);
+  if (XR_SUCCEEDED(paused)) {
+    s.passthroughStarted = false;
+    LOGI("passthrough paused");
+  } else {
+    LOGE("xrPassthroughPauseFB failed: %d", paused);
+  }
 }
 
 void PublishSurface(Session& s) {
@@ -701,10 +798,17 @@ void PollInput(Session& s, JNIEnv* env) {
       const int next = (s.background.load() + 1) % 3;
       // Passthrough has to be running before it can be composited; falling
       // back to black is better than a frame of nothing.
-      if (static_cast<Background>(next) == Background::Passthrough && !EnsurePassthrough(s)) {
-        s.background.store(static_cast<int>(Background::Black));
-        DispatchInput(env, kInputBackgroundBase + static_cast<int>(Background::Black));
+      if (static_cast<Background>(next) == Background::Passthrough) {
+        if (EnsurePassthrough(s)) {
+          s.background.store(next);
+          DispatchInput(env, kInputBackgroundBase + next);
+        } else {
+          s.background.store(static_cast<int>(Background::Black));
+          DispatchInput(env, kInputBackgroundBase + static_cast<int>(Background::Black));
+        }
       } else {
+        // Leaving passthrough stops it rather than merely hiding it.
+        PausePassthrough(s);
         s.background.store(next);
         DispatchInput(env, kInputBackgroundBase + next);
       }
@@ -794,6 +898,13 @@ void SubmitFrame(Session& s) {
   // curved surface some way off, which softens it, and video is exactly the
   // content this is meant for. Chained ahead of the layout so both reach the
   // layer.
+  // Sharpening is off by default. It is not the uniform, free quality win it
+  // looks like: on a Quest 3 it brightens a disc in the middle of the layer,
+  // lifting blacks to grey inside a circle that follows the head. Watching a
+  // dark film through a washed-out porthole is far worse than a slightly soft
+  // picture. Re-enable per session with
+  //   adb shell setprop debug.plezy.xr.sharpen 1
+  // if a future runtime applies it evenly.
   XrCompositionLayerSettingsFB layerSettings{XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB};
   layerSettings.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SHARPENING_BIT_FB;
   layerSettings.next = &imageLayout;
@@ -819,7 +930,7 @@ void SubmitFrame(Session& s) {
   }
 
   XrCompositionLayerCylinderKHR cylinder{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
-  cylinder.next = &layerSettings;
+  cylinder.next = g_debug.sharpen ? static_cast<const void*>(&layerSettings) : static_cast<const void*>(&imageLayout);
   cylinder.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
   cylinder.space = s.space;
   cylinder.eyeVisibility = stereo == StereoMode::Mono ? XR_EYE_VISIBILITY_BOTH : XR_EYE_VISIBILITY_LEFT;
@@ -861,6 +972,21 @@ void SubmitFrame(Session& s) {
   cylinderRight.eyeVisibility = XR_EYE_VISIBILITY_RIGHT;
   cylinderRight.subImage.imageRect = rightRect;
 
+  // Same cylinder as the picture, so a subtitle sits exactly where mpv drew
+  // it relative to the frame. Alpha-blended, since the plane is transparent
+  // everywhere there is no text.
+  XrCompositionLayerImageLayoutFB subtitleLayout{XR_TYPE_COMPOSITION_LAYER_IMAGE_LAYOUT_FB};
+  subtitleLayout.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
+
+  XrCompositionLayerCylinderKHR subtitles = cylinder;
+  subtitles.next = &subtitleLayout;
+  subtitles.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+  subtitles.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+  subtitles.subImage.swapchain = s.subtitleSwapchain;
+  subtitles.subImage.imageRect.offset = {0, 0};
+  subtitles.subImage.imageRect.extent = {s.width, s.height};
+
+  const bool showSubtitles = s.subtitleSwapchain != XR_NULL_HANDLE;
   const bool showOsd = s.osdSwapchain != XR_NULL_HANDLE && s.osdVisible.load();
   const bool isStereo = stereo != StereoMode::Mono;
   const Background background = static_cast<Background>(s.background.load());
@@ -895,12 +1021,13 @@ void SubmitFrame(Session& s) {
   const bool showPassthrough = background == Background::Passthrough && s.passthroughLayer != XR_NULL_HANDLE;
   const bool showStarfield = background == Background::Space && s.starfieldSwapchain != XR_NULL_HANDLE;
 
-  const XrCompositionLayerBaseHeader* layers[5];
+  const XrCompositionLayerBaseHeader* layers[6];
   uint32_t layerCount = 0;
   if (showPassthrough) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&passthroughLayer);
   if (showStarfield) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&starfield);
-  layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&cylinder);
+  if (!g_debug.noVideoLayer) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&cylinder);
   if (isStereo) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&cylinderRight);
+  if (showSubtitles) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&subtitles);
   if (showOsd) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&osd);
 
   XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
@@ -974,6 +1101,27 @@ void RunSession(Session& s) {
   }
 
   if (s.running) xrEndSession(s.session);
+  PausePassthrough(s);
+  if (s.passthroughLayer != XR_NULL_HANDLE) {
+    PFN_xrDestroyPassthroughLayerFB destroyLayer = nullptr;
+    if (XR_SUCCEEDED(xrGetInstanceProcAddr(s.instance, "xrDestroyPassthroughLayerFB",
+                                           reinterpret_cast<PFN_xrVoidFunction*>(&destroyLayer))) &&
+        destroyLayer != nullptr) {
+      destroyLayer(s.passthroughLayer);
+    }
+    s.passthroughLayer = XR_NULL_HANDLE;
+  }
+  if (s.passthrough != XR_NULL_HANDLE) {
+    PFN_xrDestroyPassthroughFB destroyPassthrough = nullptr;
+    if (XR_SUCCEEDED(xrGetInstanceProcAddr(s.instance, "xrDestroyPassthroughFB",
+                                           reinterpret_cast<PFN_xrVoidFunction*>(&destroyPassthrough))) &&
+        destroyPassthrough != nullptr) {
+      destroyPassthrough(s.passthrough);
+    }
+    s.passthrough = XR_NULL_HANDLE;
+  }
+  if (s.subtitleSwapchain != XR_NULL_HANDLE) xrDestroySwapchain(s.subtitleSwapchain);
+  s.subtitleSwapchain = XR_NULL_HANDLE;
   if (s.starfieldSwapchain != XR_NULL_HANDLE) xrDestroySwapchain(s.starfieldSwapchain);
   s.starfieldSwapchain = XR_NULL_HANDLE;
   if (s.actionSet != XR_NULL_HANDLE) xrDestroyActionSet(s.actionSet);
@@ -987,6 +1135,8 @@ void RunSession(Session& s) {
   if (s.session != XR_NULL_HANDLE) xrDestroySession(s.session);
   if (s.instance != XR_NULL_HANDLE) xrDestroyInstance(s.instance);
   DestroyEgl(s);
+  if (s.subtitleSurface != nullptr) env->DeleteGlobalRef(s.subtitleSurface);
+  s.subtitleSurface = nullptr;
   if (s.starfieldSurface != nullptr) env->DeleteGlobalRef(s.starfieldSurface);
   s.starfieldSurface = nullptr;
   if (s.osdSurface != nullptr) env->DeleteGlobalRef(s.osdSurface);
@@ -1014,6 +1164,7 @@ extern "C" JNIEXPORT jobject JNICALL Java_com_edde746_plezy_xr_ImmersiveSession_
     LOGW("a session is already running");
     return nullptr;
   }
+  g_debug.Load();
   env->GetJavaVM(&s.vm);
   s.activity = env->NewGlobalRef(activity);
   if (s.sessionClass == nullptr) {
@@ -1061,6 +1212,11 @@ Java_com_edde746_plezy_xr_ImmersiveSession_nativeOsdSurface(JNIEnv*, jclass) {
 extern "C" JNIEXPORT jobject JNICALL
 Java_com_edde746_plezy_xr_ImmersiveSession_nativeStarfieldSurface(JNIEnv*, jclass) {
   return g_session.starfieldSurface;
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_edde746_plezy_xr_ImmersiveSession_nativeSubtitleSurface(JNIEnv*, jclass) {
+  return g_session.subtitleSurface;
 }
 
 extern "C" JNIEXPORT void JNICALL

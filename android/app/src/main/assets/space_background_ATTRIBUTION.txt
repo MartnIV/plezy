@@ -1,0 +1,10 @@
+space_background.jpg
+
+Derived from "The Milky Way panorama" by ESO/S. Brunier.
+Source:  https://www.eso.org/public/images/eso0932a/
+Licence: Creative Commons Attribution 4.0 International (CC BY 4.0)
+         https://creativecommons.org/licenses/by/4.0/
+
+Changes: colour graded toward pink, darkened, and re-encoded. The original is
+a 360x180 equirectangular panorama, which is why it maps directly onto the
+immersive player's equirect background layer without reprojection.

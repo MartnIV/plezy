@@ -18,7 +18,10 @@
 #include <sys/system_properties.h>
 
 #include <atomic>
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
@@ -62,11 +65,40 @@ struct DebugSwitches {
     return value[0] == '1';
   }
 
+  static float Number(const char* name, float fallback) {
+    char value[PROP_VALUE_MAX] = {0};
+    if (__system_property_get(name, value) <= 0) return fallback;
+    const float parsed = std::strtof(value, nullptr);
+    return parsed > 0.0f ? parsed : fallback;
+  }
+
+  static float Optional(const char* name) {
+    return Number(name, 0.0f);
+  }
+
+  // Screen geometry, tunable without a rebuild. How far away a virtual screen
+  // should sit is a judgement made by wearing it, and each build-and-test
+  // round costs minutes plus someone putting a headset on -- far too slow a
+  // loop for choosing a number by feel.
+  //
+  //   adb shell setprop debug.plezy.xr.screen_distance 3.0
+  //   adb shell setprop debug.plezy.xr.screen_angle 80
+  //   adb shell setprop debug.plezy.xr.osd_distance 2.0
+  float screenDistance = 0.0f;
+  float screenAngleDegrees = 0.0f;
+  float osdDistance = 0.0f;
+
   void Load() {
     noPassthroughExtension = Flag("debug.plezy.xr.no_passthrough_ext");
     sharpen = Flag("debug.plezy.xr.sharpen");
     noExtraSwapchains = Flag("debug.plezy.xr.no_extra_swapchains");
     noVideoLayer = Flag("debug.plezy.xr.no_video_layer");
+    // Literals rather than the constants below, which are declared after this
+    // struct; they are kept in step by the static_asserts beside them.
+    // Zero means "unset": the screen buttons supply the value instead.
+    screenDistance = Number("debug.plezy.xr.screen_distance", 0.0f);
+    screenAngleDegrees = Number("debug.plezy.xr.screen_angle", 0.0f);
+    osdDistance = Number("debug.plezy.xr.osd_distance", 0.0f);
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
                         "debug switches: passthrough_ext=%d sharpen=%d extra_swapchains=%d video_layer=%d",
                         !noPassthroughExtension, sharpen, !noExtraSwapchains, !noVideoLayer);
@@ -88,12 +120,19 @@ constexpr float kScreenHeightOffsetMeters = 0.0f;
 // is a glance down rather than a refocus across the whole picture, and it never
 // covers the film.
 constexpr float kOsdDistanceMeters = 2.6f;
+// The defaults in DebugSwitches::Load are written as literals because that
+// struct is declared first; these keep the two from drifting apart.
+static_assert(kScreenRadiusMeters == 4.0f, "update the screen_distance default");
+static_assert(kOsdDistanceMeters == 2.6f, "update the osd_distance default");
 constexpr float kOsdHeightOffsetMeters = -0.75f;
-constexpr float kOsdWidthMeters = 1.5f;
+constexpr float kOsdWidthMeters = 1.62f;
 // Higher than the bar strictly needs on screen, because it is magnified
 // across a metre and a half of virtual width and every soft edge shows.
 constexpr int kOsdPixelWidth = 1792;
-constexpr int kOsdPixelHeight = 320;
+// Taller than before: the bar now has three rows -- title, progress, and the
+// transport and buttons -- which is the arrangement every video player uses
+// and the one a viewer already knows how to read.
+constexpr int kOsdPixelHeight = 460;
 
 // How a 3D film packs both eyes into one picture. Nothing detects this: the
 // container rarely says, and guessing wrong is worse than asking, so the
@@ -116,9 +155,40 @@ constexpr int kStarfieldWidth = 6000;
 constexpr int kStarfieldHeight = 3000;
 
 // The control bar's buttons, navigated with the stick rather than pointed at.
-constexpr int kButtonCount = 2;
-constexpr int kButtonBackToPanel = 0;
-constexpr int kButtonBackground = 1;
+// Focus 0 is the play/pause disc the bar already draws at its left edge, not
+// a button of its own: the state is shown there, so a separate control saying
+// the same thing would be two answers to one question. 1 and 2 are the pills
+// on the right.
+// Everything goes through the bar. The stick moves between controls and A
+// presses the one that is lit -- nothing acts directly any more, so there is
+// no hidden second way to do things and no unfocused state in which the bar
+// shows no highlight at all.
+constexpr int kButtonCount = 6;
+constexpr int kButtonSeekBack = 0;
+constexpr int kButtonPlayPause = 1;
+constexpr int kButtonSeekForward = 2;
+constexpr int kButtonScreen = 3;
+constexpr int kButtonBackToPanel = 4;
+constexpr int kButtonBackground = 5;
+// Play/pause is where focus starts: the middle of the transport group, one
+// step from the seek controls either side.
+constexpr int kInitialFocus = kButtonPlayPause;
+
+// Screen presets. Distance and angle are deliberately varied together: angle
+// decides how much of the view the picture fills, distance decides how far the
+// eyes focus, and the comfortable pairings are not independent. A big screen
+// pushed close is tiring; a small one far away is pointless.
+struct ScreenPreset {
+  float distanceMeters;
+  float angleDegrees;
+};
+constexpr ScreenPreset kScreenPresets[] = {
+    {2.4f, 84.0f},  // close
+    {3.2f, 74.0f},  // standard
+    {4.6f, 64.0f},  // cinema
+};
+constexpr int kScreenPresetCount = 3;
+constexpr int kDefaultScreenPreset = 1;
 
 struct Session {
   JavaVM* vm = nullptr;
@@ -162,6 +232,7 @@ struct Session {
   std::atomic<bool> refreshRatePending{false};
 
   std::atomic<int> background{static_cast<int>(Background::Black)};
+  std::atomic<int> screenPreset{kDefaultScreenPreset};
   XrSwapchain starfieldSwapchain = XR_NULL_HANDLE;
   jobject starfieldSurface = nullptr;  // global ref
   XrPassthroughFB passthrough = XR_NULL_HANDLE;
@@ -170,8 +241,12 @@ struct Session {
 
   // -1 when the viewer is watching rather than navigating. The stick doubles
   // as seek and as a d-pad, and this is which of the two it currently means.
-  std::atomic<int> uiFocus{-1};
+  std::atomic<int> uiFocus{kInitialFocus};
   int lastSeekVertical = 0;
+  // Hold-to-repeat state. A stick held over is a request to keep going, and
+  // one nudge per push makes crossing a two-hour film absurd.
+  std::chrono::steady_clock::time_point holdStart{};
+  std::chrono::steady_clock::time_point lastRepeat{};
   bool actionsAttached = false;
   // Rising-edge latch for the stick, so holding it does not spray seeks.
   int lastSeekDirection = 0;
@@ -274,6 +349,8 @@ bool CreateInstanceAndSystem(Session& s) {
       "XR_FB_composition_layer_settings",
       // Lets the headset run at a multiple of the film's frame rate.
       "XR_FB_display_refresh_rate",
+      // Additive compositing for the subtitle plane; see SubmitFrame.
+      "XR_FB_composition_layer_alpha_blend",
   };
   // The room behind the screen. Separated so it can be left out while
   // bisecting a visual artefact.
@@ -417,6 +494,8 @@ constexpr int kInputStereoModeBase = 10;
 constexpr int kInputFocusBase = 20;
 // Which background is showing (base + mode).
 constexpr int kInputBackgroundBase = 30;
+// Which screen preset is active (base + index).
+constexpr int kInputScreenBase = 40;
 
 
 XrPath ToPath(XrInstance instance, const char* text) {
@@ -781,18 +860,36 @@ void PollInput(Session& s, JNIEnv* env) {
   syncInfo.activeActionSets = &active;
   if (XR_FAILED(xrSyncActions(s.session, &syncInfo))) return;
 
-  const auto pressed = [&](XrAction action) {
+  const auto readBoolean = [&](XrAction action) {
     XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO};
     getInfo.action = action;
     XrActionStateBoolean state{XR_TYPE_ACTION_STATE_BOOLEAN};
-    if (XR_FAILED(xrGetActionStateBoolean(s.session, &getInfo, &state))) return false;
+    if (XR_FAILED(xrGetActionStateBoolean(s.session, &getInfo, &state))) {
+      state.isActive = XR_FALSE;
+      state.currentState = XR_FALSE;
+      state.changedSinceLastSync = XR_FALSE;
+    }
+    return state;
+  };
+  const auto pressed = [&](XrAction action) {
+    const XrActionStateBoolean state = readBoolean(action);
     // changedSinceLastSync is what makes this a press rather than a hold.
     return state.isActive == XR_TRUE && state.currentState == XR_TRUE && state.changedSinceLastSync == XR_TRUE;
   };
 
   if (pressed(s.playPauseAction)) {
     const int focus = s.uiFocus.load();
-    if (focus == kButtonBackToPanel) {
+    if (focus == kButtonPlayPause) {
+      DispatchInput(env, kInputPlayPause);
+    } else if (focus == kButtonSeekBack) {
+      DispatchInput(env, kInputSeekBackward);
+    } else if (focus == kButtonSeekForward) {
+      DispatchInput(env, kInputSeekForward);
+    } else if (focus == kButtonScreen) {
+      const int next = (s.screenPreset.load() + 1) % kScreenPresetCount;
+      s.screenPreset.store(next);
+      DispatchInput(env, kInputScreenBase + next);
+    } else if (focus == kButtonBackToPanel) {
       DispatchInput(env, kInputExit);
     } else if (focus == kButtonBackground) {
       const int next = (s.background.load() + 1) % 3;
@@ -817,6 +914,40 @@ void PollInput(Session& s, JNIEnv* env) {
     }
   }
   if (pressed(s.exitAction)) DispatchInput(env, kInputExit);
+
+  // Holding the button down on a seek control keeps seeking, slowly at first
+  // and then faster. A film is hours long and a step is seconds, so crossing
+  // one a press at a time is absurd; the ramp means a short hold still moves a
+  // little and a long one travels.
+  {
+    const XrActionStateBoolean activate = readBoolean(s.playPauseAction);
+    const bool held = activate.isActive == XR_TRUE && activate.currentState == XR_TRUE;
+    const int focus = s.uiFocus.load();
+    const bool onSeek = focus == kButtonSeekBack || focus == kButtonSeekForward;
+    const auto now = std::chrono::steady_clock::now();
+
+    if (!held || !onSeek) {
+      s.holdStart = now;
+      s.lastRepeat = now;
+    } else {
+      constexpr auto kFirstRepeatDelay = std::chrono::milliseconds(450);
+      constexpr auto kSlowestRepeat = std::chrono::milliseconds(280);
+      constexpr auto kFastestRepeat = std::chrono::milliseconds(60);
+      // How long a hold takes to reach full speed.
+      constexpr float kRampMs = 2200.0f;
+
+      const auto heldFor = std::chrono::duration_cast<std::chrono::milliseconds>(now - s.holdStart);
+      if (heldFor >= kFirstRepeatDelay) {
+        const float ramp = std::min(1.0f, (heldFor.count() - kFirstRepeatDelay.count()) / kRampMs);
+        const auto interval = std::chrono::milliseconds(static_cast<long>(
+            kSlowestRepeat.count() + (kFastestRepeat.count() - kSlowestRepeat.count()) * ramp));
+        if (now - s.lastRepeat >= interval) {
+          DispatchInput(env, focus == kButtonSeekForward ? kInputSeekForward : kInputSeekBackward);
+          s.lastRepeat = now;
+        }
+      }
+    }
+  }
   // Handled here rather than through Dart: it moves the screen, which is this
   // side's business entirely and should not wait on a round trip.
   if (pressed(s.recenterAction)) s.recenterRequested.store(true);
@@ -838,31 +969,20 @@ void PollInput(Session& s, JNIEnv* env) {
     const int horizontal = seek.currentState.x > kDeadzone ? 1 : (seek.currentState.x < -kDeadzone ? -1 : 0);
     const int vertical = seek.currentState.y > kDeadzone ? 1 : (seek.currentState.y < -kDeadzone ? -1 : 0);
 
-    // Up reaches the buttons, down goes back to watching. The stick means
-    // "seek" or "move between buttons" depending on which of those two the
-    // viewer is currently doing, the way a remote's d-pad does.
-    if (vertical != s.lastSeekVertical) {
-      if (vertical > 0 && s.uiFocus.load() < 0) {
-        s.uiFocus.store(0);
-        DispatchInput(env, kInputFocusBase + 0);
-      } else if (vertical < 0 && s.uiFocus.load() >= 0) {
-        s.uiFocus.store(-1);
-        DispatchInput(env, kInputFocusBase - 1);
-      }
-      s.lastSeekVertical = vertical;
-    }
+    // Vertical does nothing: there is no focused/unfocused mode to switch
+    // between now that every control lives in the bar.
+    s.lastSeekVertical = vertical;
 
+    // One step per push. Six controls is a short row, and a stick that
+    // repeats through it overshoots more often than it saves time; the
+    // repeat belongs on the seek controls, where there is actually distance
+    // to cover.
     if (horizontal != s.lastSeekDirection) {
-      const int focus = s.uiFocus.load();
-      if (focus >= 0) {
-        if (horizontal != 0) {
-          const int next = (focus + (horizontal > 0 ? 1 : kButtonCount - 1)) % kButtonCount;
-          s.uiFocus.store(next);
-          DispatchInput(env, kInputFocusBase + next);
-        }
-      } else {
-        if (horizontal > 0) DispatchInput(env, kInputSeekForward);
-        if (horizontal < 0) DispatchInput(env, kInputSeekBackward);
+      if (horizontal != 0) {
+        const int focus = s.uiFocus.load();
+        const int next = (focus + (horizontal > 0 ? 1 : kButtonCount - 1)) % kButtonCount;
+        s.uiFocus.store(next);
+        DispatchInput(env, kInputFocusBase + next);
       }
       s.lastSeekDirection = horizontal;
     }
@@ -941,8 +1061,13 @@ void SubmitFrame(Session& s) {
   // along -Z and every point of it is the same distance from the eyes.
   cylinder.pose.orientation.w = 1.0f;
   cylinder.pose.position = {0.0f, kScreenHeightOffsetMeters, 0.0f};
-  cylinder.radius = kScreenRadiusMeters;
-  cylinder.centralAngle = kScreenCentralAngleRadians;
+  const ScreenPreset& preset = kScreenPresets[s.screenPreset.load() % kScreenPresetCount];
+  // A property overrides the preset, so a number can still be dialled in by
+  // hand while tuning without disturbing what the buttons offer.
+  const float screenDistance = g_debug.screenDistance > 0.0f ? g_debug.screenDistance : preset.distanceMeters;
+  const float screenAngle = g_debug.screenAngleDegrees > 0.0f ? g_debug.screenAngleDegrees : preset.angleDegrees;
+  cylinder.radius = screenDistance;
+  cylinder.centralAngle = screenAngle / 57.29578f;
   cylinder.aspectRatio = kScreenAspectRatio;
 
   // The control bar, composited over the film. Later layers draw on top, so
@@ -963,8 +1088,13 @@ void SubmitFrame(Session& s) {
   osd.subImage.imageRect.extent = {kOsdPixelWidth, kOsdPixelHeight};
   osd.subImage.imageArrayIndex = 0;
   osd.pose.orientation.w = 1.0f;
-  osd.pose.position = {0.0f, kOsdHeightOffsetMeters, -kOsdDistanceMeters};
-  osd.size = {kOsdWidthMeters, kOsdWidthMeters * kOsdPixelHeight / kOsdPixelWidth};
+  // The bar keeps its distance relative to the screen, so moving the screen
+  // does not leave it stranded in front of or behind the film.
+  const float screenScale = screenDistance / kScreenRadiusMeters;
+  const float osdBase = g_debug.osdDistance > 0.0f ? g_debug.osdDistance : kOsdDistanceMeters;
+  osd.pose.position = {0.0f, kOsdHeightOffsetMeters * screenScale, -osdBase * screenScale};
+  osd.size = {kOsdWidthMeters * screenScale, kOsdWidthMeters * screenScale * kOsdPixelHeight / kOsdPixelWidth};
+
 
   // The right eye's half, when there is one. A copy of the left layer with the
   // other rectangle and the other eye.
@@ -978,8 +1108,30 @@ void SubmitFrame(Session& s) {
   XrCompositionLayerImageLayoutFB subtitleLayout{XR_TYPE_COMPOSITION_LAYER_IMAGE_LAYOUT_FB};
   subtitleLayout.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
 
+  // Added to the picture rather than blended over it.
+  //
+  // mpv's OSD plane is not transparent where there is no text: this fork fills
+  // the letterbox margins with opaque black on purpose, because a transparent
+  // margin scans out as the compositor's background and some TV pipelines
+  // render that as grey bars in HDR. Correct on a television, where the plane
+  // sits directly over the video; wrong here, where it is a separate layer and
+  // those margins paint black bars across the film whenever a subtitle is on
+  // screen.
+  //
+  // Additive compositing makes black contribute nothing, so the margins vanish
+  // and the text still lands. The cost is that the dark outline around
+  // subtitles stops darkening -- text is slightly less crisp against bright
+  // scenes -- which is a far better trade than bars appearing and disappearing
+  // with every line of dialogue.
+  XrCompositionLayerAlphaBlendFB subtitleBlend{XR_TYPE_COMPOSITION_LAYER_ALPHA_BLEND_FB};
+  subtitleBlend.srcFactorColor = XR_BLEND_FACTOR_ONE_FB;
+  subtitleBlend.dstFactorColor = XR_BLEND_FACTOR_ONE_FB;
+  subtitleBlend.srcFactorAlpha = XR_BLEND_FACTOR_ONE_FB;
+  subtitleBlend.dstFactorAlpha = XR_BLEND_FACTOR_ONE_FB;
+  subtitleBlend.next = &subtitleLayout;
+
   XrCompositionLayerCylinderKHR subtitles = cylinder;
-  subtitles.next = &subtitleLayout;
+  subtitles.next = &subtitleBlend;
   subtitles.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
   subtitles.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
   subtitles.subImage.swapchain = s.subtitleSwapchain;

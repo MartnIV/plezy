@@ -51,6 +51,9 @@ object ImmersiveSession {
   @JvmStatic
   external fun nativeStarfieldSurface(): Surface?
 
+  @JvmStatic
+  external fun nativeSubtitleSurface(): Surface?
+
   /**
    * Tells the session what frame rate the film runs at, so the headset can be
    * asked for a whole multiple of it.
@@ -73,7 +76,14 @@ object ImmersiveSession {
    */
   private val osdHandler = Handler(Looper.getMainLooper())
   private var osdHideRunnable: Runnable? = null
-  private const val OSD_VISIBLE_MS = 4_000L
+  /**
+   * How long the bar stays up after the last press.
+   *
+   * Longer than a screen OSD would need: this is the only way to control
+   * anything now, and it floats in the room, so it has to linger long enough
+   * to be used but not so long that it becomes furniture during a film.
+   */
+  private const val OSD_VISIBLE_MS = 5_000L
 
   @Volatile
   private var lastStatus: ImmersivePlaybackStatus? = null
@@ -82,7 +92,7 @@ object ImmersiveSession {
   private var starfieldDrawn = false
 
   @Synchronized
-  fun showOsd(status: ImmersivePlaybackStatus, autoHide: Boolean = focusedButton < 0) {
+  fun showOsd(status: ImmersivePlaybackStatus, autoHide: Boolean = true) {
     lastStatus = status
     val surface = nativeOsdSurface()
     if (surface == null) {
@@ -174,18 +184,43 @@ object ImmersiveSession {
   private const val INPUT_STEREO_MODE_BASE = 10
   private const val INPUT_FOCUS_BASE = 20
   private const val INPUT_BACKGROUND_BASE = 30
+  private const val INPUT_SCREEN_BASE = 40
+
+  private val screenLabels = arrayOf("Close", "Standard", "Cinema")
+
+  @Volatile
+  private var screenPreset = 1
 
   private val backgroundLabels = arrayOf("Black", "Space", "Passthrough")
 
   /** Which button the stick is on, and what the buttons say. */
+  /**
+   * Which control is lit. Never -1: every control lives in the bar now, so
+   * there is no state in which nothing is focused and the bar looks inert.
+   */
   @Volatile
-  private var focusedButton = -1
+  private var focusedButton = 1
 
   @Volatile
   private var backgroundMode = 0
 
-  private fun buttonLabels(): List<String> =
-    listOf("Back to panel", "Background: ${backgroundLabels.getOrElse(backgroundMode) { "?" }}")
+  /**
+   * Mirrors the button order in immersive_session.cpp.
+   *
+   * Play/pause is a button of its own as well as the bare A press, so the row
+   * is a complete set of controls: reaching the bar should not mean losing the
+   * one control the viewer wants most, or having to drop out of it to pause.
+   * The label follows the state, so it always says what pressing it will do.
+   */
+  /**
+   * The pills on the right. The three transport controls to their left are
+   * drawn as glyphs and occupy focus 0, 1 and 2, so these start at 3.
+   */
+  private fun buttonLabels(): List<String> = listOf(
+    "Screen: ${screenLabels.getOrElse(screenPreset) { "?" }}",
+    "Back to panel",
+    "Background: ${backgroundLabels.getOrElse(backgroundMode) { "?" }}",
+  )
 
   private val stereoLabels = arrayOf("2D", "3D side-by-side", "3D top/bottom")
 
@@ -193,6 +228,11 @@ object ImmersiveSession {
   fun onInputFromNative(action: Int) {
     if (action == INPUT_EXIT) {
       onSessionEnded?.invoke()
+      return
+    }
+    if (action >= INPUT_SCREEN_BASE) {
+      screenPreset = action - INPUT_SCREEN_BASE
+      showNotice("Screen: ${screenLabels.getOrElse(screenPreset) { "?" }}")
       return
     }
     if (action >= INPUT_BACKGROUND_BASE) {
@@ -212,9 +252,11 @@ object ImmersiveSession {
       showNotice("Background: ${backgroundLabels.getOrElse(backgroundMode) { "?" }}")
       return
     }
-    if (action >= INPUT_FOCUS_BASE - 1 && action <= INPUT_FOCUS_BASE + 8) {
+    if (action in (INPUT_FOCUS_BASE)..(INPUT_FOCUS_BASE + 8)) {
       focusedButton = action - INPUT_FOCUS_BASE
-      lastStatus?.let { showOsd(it) } ?: showNotice("")
+      Log.i(TAG, "focus -> $focusedButton")
+      val status = lastStatus
+      if (status != null) showOsd(status) else showNotice("")
       return
     }
     if (action >= INPUT_STEREO_MODE_BASE) {
@@ -256,7 +298,7 @@ object ImmersiveSession {
     // one is gone: the flag must not survive the session that set it, or the
     // sky is drawn once ever and is black on every subsequent visit.
     starfieldDrawn = false
-    focusedButton = -1
+    focusedButton = 1
     appContext = activity.applicationContext
     return nativeStart(activity, width, height)
   }
@@ -300,7 +342,15 @@ class ImmersivePlayerActivity : Activity() {
 
     val core = ActiveVideoPlayer.current()
     if (core != null) {
-      core.attachExternalVideoSurface(started, ImmersiveSession.DEFAULT_WIDTH, ImmersiveSession.DEFAULT_HEIGHT)
+      // The subtitle plane goes with the picture: mpv renders subtitles into
+      // it, and its layer is composited with the same geometry as the film.
+      val subtitles = ImmersiveSession.nativeSubtitleSurface()
+      core.attachExternalVideoSurface(
+        started,
+        subtitles,
+        ImmersiveSession.DEFAULT_WIDTH,
+        ImmersiveSession.DEFAULT_HEIGHT,
+      )
       attachedToPlayer = true
       Log.i(TAG, "video output redirected to the immersive swapchain")
     } else {

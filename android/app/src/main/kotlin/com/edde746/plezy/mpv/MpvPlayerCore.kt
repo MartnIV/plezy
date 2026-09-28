@@ -1309,16 +1309,20 @@ class MpvPlayerCore private constructor(
    * [width] and [height] are the swapchain's, not the panel's; mpv scales to
    * them and the compositor samples the result.
    */
-  fun attachExternalVideoSurface(surface: Surface, width: Int, height: Int) {
+  fun attachExternalVideoSurface(surface: Surface, osd: Surface?, width: Int, height: Int) {
     if (disposing) return
     if (!surface.isValid) {
       PlayerDebugLog.d(TAG) { "Refusing an invalid external surface" }
       return
     }
-    PlayerDebugLog.d(TAG) { "Attaching external video surface ${width}x$height" }
+    PlayerDebugLog.d(TAG) { "Attaching external video surface ${width}x$height osd=${osd != null}" }
     externalVideoSurface = surface
     pendingSurface = surface
+    // mpv draws subtitles into a separate plane rather than burning them into
+    // the picture, so without one they simply vanish on the big screen.
+    pendingOsdSurface = osd?.takeIf { it.isValid }
     videoSurfaceGeneration += 1L
+    osdSurfaceGeneration += 1L
     videoOutputEpoch += 1L
     rememberSurfaceSize(width, height)
     if (player == null) {
@@ -1343,7 +1347,9 @@ class MpvPlayerCore private constructor(
     externalVideoSurface = null
     val panelSurface = surfaceView?.holder?.surface?.takeIf { it.isValid }
     pendingSurface = panelSurface
+    pendingOsdSurface = osdSurfaceView?.holder?.surface?.takeIf { it.isValid }
     videoSurfaceGeneration += 1L
+    osdSurfaceGeneration += 1L
     videoOutputEpoch += 1L
     rememberCurrentSurfaceSize()
     if (player == null) return
@@ -1404,6 +1410,10 @@ class MpvPlayerCore private constructor(
   private val osdSurfaceCallback = object : SurfaceHolder.Callback {
     override fun surfaceCreated(holder: SurfaceHolder) {
       if (disposing) return
+      if (externalVideoSurface != null) {
+        PlayerDebugLog.d(TAG) { "Ignoring OSD surfaceCreated: video output is external" }
+        return
+      }
       pendingOsdSurface = holder.surface.takeIf { it.isValid }
       osdSurfaceGeneration += 1L
       PlayerDebugLog.d(TAG) { "OSD surface created" }
@@ -1421,6 +1431,10 @@ class MpvPlayerCore private constructor(
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
       PlayerDebugLog.d(TAG) { "OSD surface destroyed" }
+      if (externalVideoSurface != null) {
+        PlayerDebugLog.d(TAG) { "Ignoring OSD surfaceDestroyed: video output is external" }
+        return
+      }
       pendingOsdSurface = null
       if (disposing) {
         awaitNativeDisposal()

@@ -167,96 +167,61 @@ object ImmersiveOsd {
       // buffer is free, which still holds an older frame's content.
       canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
 
-      val inset = h * 0.06f
+      val inset = h * 0.04f
       val body = RectF(inset, inset, w - inset, h - inset)
-      val radius = body.height() * 0.28f
+      val corner = h * 0.11f
 
-      // A soft drop shadow lifts the bar off whatever is behind it. Against
-      // passthrough especially, an unshadowed panel looks pasted on.
-      shadowPaint.setShadowLayer(h * 0.10f, 0f, h * 0.025f, Color.argb(160, 0, 0, 0))
-      canvas.drawRoundRect(body, radius, radius, shadowPaint)
-
-      // Vertical gradient rather than a flat fill: flat panels are exactly
-      // what reads as unfinished.
+      shadowPaint.setShadowLayer(h * 0.07f, 0f, h * 0.018f, Color.argb(170, 0, 0, 0))
+      canvas.drawRoundRect(body, corner, corner, shadowPaint)
       panelPaint.shader = android.graphics.LinearGradient(
         0f, body.top, 0f, body.bottom,
-        Color.argb(234, 26, 28, 36), Color.argb(238, 14, 15, 20),
+        Color.argb(238, 27, 29, 38), Color.argb(242, 13, 14, 19),
         android.graphics.Shader.TileMode.CLAMP,
       )
-      canvas.drawRoundRect(body, radius, radius, panelPaint)
+      canvas.drawRoundRect(body, corner, corner, panelPaint)
       panelPaint.shader = null
+      borderPaint.strokeWidth = h * 0.005f
+      borderPaint.color = Color.argb(44, 255, 255, 255)
+      canvas.drawRoundRect(body, corner, corner, borderPaint)
 
-      // A hairline top edge, the way a lit surface catches light.
-      borderPaint.strokeWidth = h * 0.008f
-      borderPaint.color = Color.argb(46, 255, 255, 255)
-      canvas.drawRoundRect(body, radius, radius, borderPaint)
+      val pad = h * 0.085f
+      val left = body.left + pad
+      val right = body.right - pad
 
-      val padding = h * 0.16f
-      val left = body.left + padding
-      val right = body.right - padding
-      val titleBaseline = body.top + h * 0.30f
-
-      // Play state, as a filled disc so it reads at a glance from across a
-      // virtual room rather than as a bare glyph.
-      val discRadius = h * 0.115f
-      val discX = left + discRadius
-      val discY = body.top + h * 0.26f
-      accentPaint.color = Color.argb(38, 150, 190, 255)
-      canvas.drawCircle(discX, discY, discRadius, accentPaint)
-      glyphPaint.color = Color.rgb(196, 220, 255)
-      if (status.isPlaying) {
-        val barW = discRadius * 0.24f
-        val barH = discRadius * 0.86f
-        val gap = discRadius * 0.24f
-        canvas.drawRoundRect(
-          RectF(discX - gap / 2f - barW, discY - barH / 2f, discX - gap / 2f, discY + barH / 2f),
-          barW * 0.4f, barW * 0.4f, glyphPaint,
-        )
-        canvas.drawRoundRect(
-          RectF(discX + gap / 2f, discY - barH / 2f, discX + gap / 2f + barW, discY + barH / 2f),
-          barW * 0.4f, barW * 0.4f, glyphPaint,
-        )
-      } else {
-        val path = android.graphics.Path().apply {
-          moveTo(discX - discRadius * 0.30f, discY - discRadius * 0.48f)
-          lineTo(discX - discRadius * 0.30f, discY + discRadius * 0.48f)
-          lineTo(discX + discRadius * 0.52f, discY)
-          close()
-        }
-        canvas.drawPath(path, glyphPaint)
-      }
-
-      val textLeft = discX + discRadius + padding * 0.75f
-
-      // The clock is measured first so the title can be told how much room is
-      // actually left, instead of being ellipsized against a guess.
-      timePaint.textSize = h * 0.115f
+      // Row 1: what is playing, and where in it. The clock lives here rather
+      // than beside the transport because the control pills grow with their
+      // labels and were running into it.
+      val headlineBaseline = body.top + h * 0.175f
+      timePaint.textSize = h * 0.092f
       timePaint.textAlign = Paint.Align.RIGHT
-      timePaint.color = Color.argb(205, 208, 214, 230)
+      timePaint.color = Color.argb(206, 206, 213, 230)
       val clock = "${formatTime(status.positionMs)}  /  ${formatTime(status.durationMs)}"
+      canvas.drawText(clock, right, headlineBaseline, timePaint)
       val clockWidth = timePaint.measureText(clock)
-      canvas.drawText(clock, right, titleBaseline, timePaint)
 
-      titlePaint.textSize = h * 0.145f
+      titlePaint.textSize = h * 0.105f
       titlePaint.textAlign = Paint.Align.LEFT
       val headline = notice ?: status.title
-      titlePaint.color = if (notice != null) Color.rgb(150, 196, 255) else Color.rgb(242, 244, 250)
-      val available = right - clockWidth - padding - textLeft
-      canvas.drawText(ellipsize(headline, titlePaint, available), textLeft, titleBaseline, titlePaint)
+      titlePaint.color = if (notice != null) Color.rgb(150, 196, 255) else Color.rgb(238, 241, 248)
+      // Measured against what the clock actually left behind, not a guess.
+      canvas.drawText(
+        ellipsize(headline, titlePaint, right - left - clockWidth - pad),
+        left,
+        headlineBaseline,
+        titlePaint,
+      )
 
-      // Progress, as a thin rounded rail with a knob -- the knob is what makes
-      // the position readable at a distance.
-      val railHeight = h * 0.042f
-      val railTop = body.top + h * 0.46f
+      // Row 2: the progress rail, full width, where every player puts it.
+      val railHeight = h * 0.030f
+      val railTop = body.top + h * 0.275f
       val railRadius = railHeight / 2f
-      trackPaint.color = Color.argb(70, 150, 158, 180)
+      trackPaint.color = Color.argb(74, 150, 158, 180)
       canvas.drawRoundRect(RectF(left, railTop, right, railTop + railHeight), railRadius, railRadius, trackPaint)
       if (status.durationMs > 0) {
         val fraction = (status.positionMs.toFloat() / status.durationMs).coerceIn(0f, 1f)
         val filledRight = left + (right - left) * fraction
         progressPaint.shader = android.graphics.LinearGradient(
-          left, 0f, right, 0f,
-          Color.rgb(96, 150, 255), Color.rgb(150, 196, 255),
+          left, 0f, right, 0f, Color.rgb(96, 150, 255), Color.rgb(156, 199, 255),
           android.graphics.Shader.TileMode.CLAMP,
         )
         if (filledRight > left) {
@@ -265,11 +230,27 @@ object ImmersiveOsd {
           )
         }
         progressPaint.shader = null
-        progressPaint.color = Color.rgb(226, 238, 255)
-        canvas.drawCircle(filledRight, railTop + railRadius, railHeight * 1.05f, progressPaint)
+        progressPaint.color = Color.rgb(232, 241, 255)
+        canvas.drawCircle(filledRight, railTop + railRadius, railHeight * 1.5f, progressPaint)
       }
 
-      if (buttons.isNotEmpty()) drawButtons(canvas, buttons, focusedButton, left, right, body.bottom, h)
+      // Row 3: transport on the left, controls on the right -- the reading
+      // order of every media player, so it needs no learning.
+      val rowCentre = body.top + h * 0.62f
+      val discRadius = h * 0.105f
+      val step = discRadius * 2.5f
+
+      // Transport group: back, play/pause, forward. Focus 0, 1, 2.
+      drawSkipControl(canvas, left + discRadius, rowCentre, discRadius * 0.86f, false, focusedButton == 0, h)
+      drawPlayControl(canvas, left + discRadius + step, rowCentre, discRadius, status.isPlaying, focusedButton == 1, h)
+      drawSkipControl(canvas, left + discRadius + step * 2f, rowCentre, discRadius * 0.86f, true, focusedButton == 2, h)
+
+      // The pills get whatever is left to the right of the transport group,
+      // and shrink their labels rather than overrun it.
+      val transportRight = left + discRadius + step * 2f + discRadius
+      if (buttons.isNotEmpty()) {
+        drawButtons(canvas, buttons, focusedButton - 3, transportRight + pad, right, rowCentre, h)
+      }
     } finally {
       try {
         target.unlockCanvasAndPost(canvas)
@@ -279,66 +260,177 @@ object ImmersiveOsd {
     }
   }
 
+  /** The play/pause control, which is also the first thing the stick focuses. */
+  private fun drawPlayControl(
+    canvas: Canvas,
+    cx: Float,
+    cy: Float,
+    radius: Float,
+    isPlaying: Boolean,
+    focused: Boolean,
+    h: Float,
+  ) {
+    if (focused) drawFocusRing(canvas, RectF(cx - radius, cy - radius, cx + radius, cy + radius), radius, h)
+    accentPaint.shader = null
+    if (focused) {
+      accentPaint.shader = android.graphics.LinearGradient(
+        cx, cy - radius, cx, cy + radius,
+        Color.rgb(162, 203, 255), Color.rgb(96, 150, 255),
+        android.graphics.Shader.TileMode.CLAMP,
+      )
+    } else {
+      accentPaint.color = Color.argb(46, 150, 190, 255)
+    }
+    canvas.drawCircle(cx, cy, radius, accentPaint)
+    accentPaint.shader = null
+
+    glyphPaint.color = if (focused) Color.rgb(9, 15, 28) else Color.rgb(202, 224, 255)
+    if (isPlaying) {
+      val barW = radius * 0.23f
+      val barH = radius * 0.84f
+      val gap = radius * 0.26f
+      canvas.drawRoundRect(
+        RectF(cx - gap / 2f - barW, cy - barH / 2f, cx - gap / 2f, cy + barH / 2f), barW * 0.4f, barW * 0.4f, glyphPaint,
+      )
+      canvas.drawRoundRect(
+        RectF(cx + gap / 2f, cy - barH / 2f, cx + gap / 2f + barW, cy + barH / 2f), barW * 0.4f, barW * 0.4f, glyphPaint,
+      )
+    } else {
+      val path = android.graphics.Path().apply {
+        moveTo(cx - radius * 0.28f, cy - radius * 0.46f)
+        lineTo(cx - radius * 0.28f, cy + radius * 0.46f)
+        lineTo(cx + radius * 0.50f, cy)
+        close()
+      }
+      canvas.drawPath(path, glyphPaint)
+    }
+  }
+
+  /** Skip back or forward, drawn as a chevron pair with a bar. */
+  private fun drawSkipControl(
+    canvas: Canvas,
+    cx: Float,
+    cy: Float,
+    radius: Float,
+    forward: Boolean,
+    focused: Boolean,
+    h: Float,
+  ) {
+    if (focused) drawFocusRing(canvas, RectF(cx - radius, cy - radius, cx + radius, cy + radius), radius, h)
+    accentPaint.shader = null
+    if (focused) {
+      accentPaint.shader = android.graphics.LinearGradient(
+        cx, cy - radius, cx, cy + radius,
+        Color.rgb(162, 203, 255), Color.rgb(96, 150, 255),
+        android.graphics.Shader.TileMode.CLAMP,
+      )
+    } else {
+      accentPaint.color = Color.argb(40, 150, 190, 255)
+    }
+    canvas.drawCircle(cx, cy, radius, accentPaint)
+    accentPaint.shader = null
+
+    glyphPaint.color = if (focused) Color.rgb(9, 15, 28) else Color.rgb(202, 224, 255)
+    val dir = if (forward) 1f else -1f
+    val size = radius * 0.46f
+    // Two chevrons, so the direction reads without a label.
+    for (i in 0..1) {
+      val ox = cx + dir * (i * size * 0.62f - size * 0.30f)
+      val path = android.graphics.Path().apply {
+        moveTo(ox - dir * size * 0.30f, cy - size)
+        lineTo(ox + dir * size * 0.34f, cy)
+        lineTo(ox - dir * size * 0.30f, cy + size)
+        close()
+      }
+      canvas.drawPath(path, glyphPaint)
+    }
+  }
+
   /**
-   * The button row, laid out from the right along the bar's lower edge.
+   * The focus ring.
    *
-   * Nothing here is pointed at, so there is no hover state: the focused button
-   * is filled and ringed, the rest are quiet outlines that do not compete with
-   * the film.
+   * Deliberately loud -- a bright halo and a hard outline outside the control.
+   * Nothing is pointed at here, so the only way to know what a press will do is
+   * to see it, and the previous treatment was too polite to read at a glance
+   * across a virtual room.
    */
+  private fun drawFocusRing(canvas: Canvas, rect: RectF, radius: Float, h: Float) {
+    val spread = h * 0.045f
+    accentPaint.shader = null
+    accentPaint.color = Color.argb(58, 130, 180, 255)
+    canvas.drawRoundRect(
+      RectF(rect.left - spread, rect.top - spread, rect.right + spread, rect.bottom + spread),
+      radius + spread, radius + spread, accentPaint,
+    )
+    borderPaint.strokeWidth = h * 0.011f
+    borderPaint.color = Color.rgb(176, 212, 255)
+    val ring = h * 0.020f
+    canvas.drawRoundRect(
+      RectF(rect.left - ring, rect.top - ring, rect.right + ring, rect.bottom + ring),
+      radius + ring, radius + ring, borderPaint,
+    )
+  }
+
+  /** The control pills, laid out from the right along the transport row. */
   private fun drawButtons(
     canvas: Canvas,
     buttons: List<String>,
     focused: Int,
-    left: Float,
+    leftLimit: Float,
     right: Float,
-    bottom: Float,
+    centreY: Float,
     h: Float,
   ) {
-    val height = h * 0.185f
-    val top = bottom - height - h * 0.10f
-    labelPaint.textSize = h * 0.098f
+    val height = h * 0.165f
+    labelPaint.textSize = h * 0.082f
     labelPaint.textAlign = Paint.Align.CENTER
+
+    // Fit the row into the space the transport group left. Labels carry their
+    // current value ("Background: Passthrough"), so they change width as the
+    // viewer uses them -- a layout that only works for the shortest of them
+    // would break as soon as one was cycled.
+    val gap = h * 0.038f
+    val available = right - leftLimit - gap * (buttons.size - 1)
+    val natural = buttons.sumOf { (labelPaint.measureText(it) + height * 1.15f).toDouble() }.toFloat()
+    val labelBudget = if (natural > available && buttons.isNotEmpty()) {
+      (available / buttons.size) - height * 1.15f
+    } else {
+      Float.MAX_VALUE
+    }
 
     var edge = right
     for (index in buttons.indices.reversed()) {
-      val label = buttons[index]
-      val width = labelPaint.measureText(label) + height * 1.25f
-      val rect = RectF(edge - width, top, edge, top + height)
+      val label = ellipsize(buttons[index], labelPaint, labelBudget)
+      val width = labelPaint.measureText(label) + height * 1.15f
+      val rect = RectF(edge - width, centreY - height / 2f, edge, centreY + height / 2f)
       val radius = height / 2f
       val isFocused = index == focused
 
       if (isFocused) {
-        // A halo outside the pill, so the focused control is obvious without
-        // the bar having to get louder overall.
-        accentPaint.color = Color.argb(60, 120, 170, 255)
-        canvas.drawRoundRect(
-          RectF(rect.left - h * 0.022f, rect.top - h * 0.022f, rect.right + h * 0.022f, rect.bottom + h * 0.022f),
-          radius + h * 0.022f, radius + h * 0.022f, accentPaint,
-        )
+        drawFocusRing(canvas, rect, radius, h)
         accentPaint.shader = android.graphics.LinearGradient(
           rect.left, rect.top, rect.left, rect.bottom,
-          Color.rgb(150, 196, 255), Color.rgb(92, 146, 250),
+          Color.rgb(162, 203, 255), Color.rgb(96, 150, 255),
           android.graphics.Shader.TileMode.CLAMP,
         )
         canvas.drawRoundRect(rect, radius, radius, accentPaint)
         accentPaint.shader = null
-        labelPaint.color = Color.rgb(10, 16, 30)
+        labelPaint.color = Color.rgb(9, 15, 28)
       } else {
-        trackPaint.color = Color.argb(56, 140, 150, 175)
+        trackPaint.color = Color.argb(60, 140, 150, 175)
         canvas.drawRoundRect(rect, radius, radius, trackPaint)
-        borderPaint.strokeWidth = h * 0.006f
-        borderPaint.color = Color.argb(48, 210, 218, 235)
+        borderPaint.strokeWidth = h * 0.004f
+        borderPaint.color = Color.argb(52, 210, 218, 235)
         canvas.drawRoundRect(rect, radius, radius, borderPaint)
-        labelPaint.color = Color.argb(224, 226, 232, 245)
+        labelPaint.color = Color.argb(226, 228, 234, 246)
       }
-      // Optical centring: text sits slightly above the geometric middle.
       canvas.drawText(label, rect.centerX(), rect.centerY() + labelPaint.textSize * 0.35f, labelPaint)
-      edge = rect.left - h * 0.05f
+      edge = rect.left - gap
     }
   }
 
   private fun ellipsize(text: String, paint: Paint, maxWidth: Float): String {
+    if (maxWidth == Float.MAX_VALUE) return text
     if (maxWidth <= 0f || paint.measureText(text) <= maxWidth) return text
     var end = text.length
     while (end > 0 && paint.measureText(text.substring(0, end) + "…") > maxWidth) end--

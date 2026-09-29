@@ -255,6 +255,11 @@ android {
     // A different id is a separate install -- it will not inherit the
     // sideloaded app's logins or downloads.
     applicationId = (findProperty("plezy.applicationId") as String?) ?: "com.edde746.plezy"
+
+    // The store requires the manifest label to be the listing's own name, and
+    // two apps may not share one. Overridden alongside the id so a store build
+    // announces itself correctly and a sideloaded one stays "Plezy".
+    manifestPlaceholders["appLabel"] = (findProperty("plezy.appLabel") as String?) ?: "Plezy"
     // Fire OS 6.x (API 25); :libmpv shares the same floor.
     //
     // The Meta Horizon Store will not accept anything below 29, and caps the
@@ -359,6 +364,15 @@ android {
 
   packaging {
     jniLibs {
+      // Headsets are all arm64. abiFilters does not reach these: the native
+      // libraries arrive from the :libmpv module's extracted tree and from
+      // prefab AARs, which are merged as jniLibs regardless of the ABI filter,
+      // so a build with it set still carried the 32-bit and x86 copies of
+      // FFmpeg, mpv and Cronet -- about a third of the download, for devices
+      // that cannot run it.
+      if (findProperty("plezy.arm64Only") == "true") {
+        excludes += setOf("lib/armeabi-v7a/**", "lib/x86/**", "lib/x86_64/**")
+      }
       // pickFirst only suppresses the duplicate libc++ merge error; the
       // sourceSets rule below makes the runtime :libmpv extracts from the
       // mpv-build tarballs win for std::from_chars<float>, while older
@@ -376,6 +390,13 @@ android {
       jniLibs.srcDir(libmpvLibcxxJniDir)
     }
   }
+
+  // A store build supplies its own manifest, generated from this one by
+  // scripts/build-meta-store.sh. The Horizon Store applies immersive-app rules
+  // to the launcher activity -- landscape only, no leanback category, a
+  // single-task launch mode -- and every one of those would break the phone
+  // and Android TV builds if it were applied here.
+  (findProperty("plezy.manifest") as String?)?.let { sourceSets["main"].manifest.srcFile(it) }
 
   // The OpenXR loader AAR ships its headers and import target as a prefab
   // package; CMake consumes it with find_package(OpenXR CONFIG).

@@ -13,7 +13,7 @@
 # sideloaded app's logins or downloads.
 #
 # Usage:
-#   scripts/build-meta-store.sh com.yourname.plezyvr
+#   scripts/build-meta-store.sh com.yourname.plezyquest "Plezy for Quest"
 set -euo pipefail
 
 APPLICATION_ID="${1:-}"
@@ -29,11 +29,21 @@ if [[ ! -f android/key.properties ]]; then
   exit 1
 fi
 
+APP_LABEL="${2:-Plezy for Quest}"
+
+# The store applies immersive-app rules to the launcher activity that would be
+# wrong everywhere else, so it gets a manifest generated from the real one.
+MANIFEST="$PWD/build/meta/AndroidManifest.xml"
+python3 scripts/meta-store-manifest.py android/app/src/main/AndroidManifest.xml "$MANIFEST"
+
 flutter build apk --release \
   --target-platform android-arm64 \
   -Pplezy.applicationId="$APPLICATION_ID" \
+  -Pplezy.appLabel="$APP_LABEL" \
   -Pplezy.minSdk=29 \
-  -Pplezy.targetSdk=34
+  -Pplezy.targetSdk=34 \
+  -Pplezy.manifest="$MANIFEST" \
+  -Pplezy.arm64Only=true
 
 APK="build/app/outputs/flutter-apk/app-release.apk"
 echo

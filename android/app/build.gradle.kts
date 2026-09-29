@@ -245,9 +245,24 @@ android {
   }
 
   defaultConfig {
-    applicationId = "com.edde746.plezy"
-    minSdk = 25 // Fire OS 6.x (API 25); :libmpv shares the same floor
-    targetSdk = flutter.targetSdkVersion
+    // Upstream's id by default, so sideloaded builds stay interchangeable with
+    // the official app and rebases do not touch this line.
+    //
+    // The Meta Horizon Store needs an id this fork actually owns: publishing
+    // under com.edde746.plezy would claim another developer's identifier and
+    // collide if upstream ever ships there. Store builds opt in with
+    //   flutter build apk --release -Pplezy.applicationId=com.example.plezyvr
+    // A different id is a separate install -- it will not inherit the
+    // sideloaded app's logins or downloads.
+    applicationId = (findProperty("plezy.applicationId") as String?) ?: "com.edde746.plezy"
+    // Fire OS 6.x (API 25); :libmpv shares the same floor.
+    //
+    // The Meta Horizon Store will not accept anything below 29, and caps the
+    // target at 34 for apps with an immersive activity, so a store build
+    // raises the floor and lowers the ceiling for itself alone -- applying
+    // either globally would drop Fire OS devices upstream still supports.
+    minSdk = (findProperty("plezy.minSdk") as String?)?.toInt() ?: 25
+    targetSdk = (findProperty("plezy.targetSdk") as String?)?.toInt() ?: flutter.targetSdkVersion
     versionCode = flutter.versionCode
     versionName = flutter.versionName
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

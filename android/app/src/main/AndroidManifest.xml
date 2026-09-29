@@ -49,6 +49,14 @@
         android:largeHeap="true"
         android:networkSecurityConfig="@xml/network_security_config"
         android:usesCleartextTraffic="true">
+        <!-- Required by the Meta Horizon Store, which will not accept a build
+             that does not say which headsets it runs on. Inert everywhere
+             else: it is metadata no other platform reads. Quest 2 and Pro are
+             listed because nothing here is Quest 3 specific: the immersive
+             player asks the runtime for what it needs and falls back. -->
+        <meta-data
+            android:name="com.oculus.supportedDevices"
+            android:value="quest2|questpro|quest3|quest3s" />
         <!-- Driver-distraction state on Android Automotive OS. Optional: the platform library is
              absent on every other form factor, and CarRestrictionsMonitor falls back silently. -->
         <uses-library android:name="android.car" android:required="false" />
